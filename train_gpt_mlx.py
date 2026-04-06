@@ -27,14 +27,21 @@ import mlx.optimizers as optim
 from mlx.utils import tree_flatten, tree_unflatten
 
 
-os.environ.setdefault("RUN_ID", "gated_shared_mlp_v1")
-os.environ.setdefault("ITERATIONS", "2000")
-os.environ.setdefault("TRAIN_BATCH_TOKENS", "65536")
-os.environ.setdefault("VAL_LOSS_EVERY", "0")
-os.environ.setdefault("VAL_BATCH_SIZE", "524288")
-os.environ.setdefault("TRAIN_LOG_EVERY", "10")
-os.environ.setdefault("SKIP_QUANTIZE", "1")
-os.environ.setdefault("MLP_MULT", "16")
+DEFAULTS = {
+    "ITERATIONS": "2000",
+    "TRAIN_BATCH_TOKENS": "65536",
+    "VAL_LOSS_EVERY": "0",
+    "VAL_BATCH_SIZE": "524288",
+    "TRAIN_LOG_EVERY": "10",
+    "SKIP_QUANTIZE": "1",
+    "MLP_MULT": "16",
+    "MTP_HEADS": "3",
+    "SKIP_VAL": "1",
+}
+for k, v in DEFAULTS.items():
+    os.environ.setdefault(k, v)
+
+os.environ.setdefault("RUN_ID", "shared_gated_mlp" + "_".join(f"{k.lower()}{os.environ[k]}" for k in ["MLP_MULT", "MTP_HEADS"]))
 
 # ==============================================================================
 # SHARD FORMAT + COMPUTE DTYPE
