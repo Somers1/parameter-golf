@@ -712,7 +712,14 @@ class Block(nn.Module):
         if self.has_gate:
             self.gate_down = CastedLinear(dim, gate_rank, bias=False)
             self.gate_up = CastedLinear(gate_rank, mlp_window, bias=False)
-            self.gate_up._zero_init = True
+            # Diverse init: each layer emphasizes a different region of the window
+            with torch.no_grad():
+                nn.init.zeros_(self.gate_up.weight)
+                t = torch.linspace(0, 2 * math.pi, mlp_window)
+                for r in range(min(gate_rank, self.gate_up.weight.shape[1])):
+                    freq = (layer_idx + 1) + r * 0.5
+                    pattern = 0.05 * torch.sin(freq * t)
+                    self.gate_up.weight.data[:, r] = pattern
 
         # Per-layer LoRA adapters on shared MLP (optional)
         self.has_adapt = adapt_rank > 0
