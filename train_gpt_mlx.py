@@ -859,13 +859,10 @@ def main() -> None:
     out_dir.mkdir(parents=True, exist_ok=True)
     logfile = out_dir / f"{args.run_id}.txt"
     if logfile.exists():
-        print(f"\nRun '{args.run_id}' already exists at {logfile}")
-        choice = input("Override (o) or enter new run_id (n)? ").strip().lower()
-        if choice == "n":
-            args.run_id = input("New run_id: ").strip()
+        choice = input(f"Run '{args.run_id}' already exists. Press enter to override or type a new run_id: ").strip()
+        if choice:
+            args.run_id = choice
             logfile = out_dir / f"{args.run_id}.txt"
-        elif choice != "o":
-            print("Aborted."); exit(1)
     print(logfile)
 
     def log(msg: str, console: bool = True) -> None:
