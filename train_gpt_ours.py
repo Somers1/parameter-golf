@@ -16,15 +16,18 @@ DEFAULTS = {
     "TRAIN_BATCH_TOKENS": "524288",
     "VAL_LOSS_EVERY": "1000",
     "VAL_BATCH_SIZE": "524288",
-    "TRAIN_LOG_EVERY": "500",
+    "TRAIN_LOG_EVERY": "100",
     "TRAIN_SEQ_LEN": "1024",
+    "VOCAB_SIZE": "1024",
     "MAX_WALLCLOCK_SECONDS": "600",
+    "MODEL_DIM": "512",
+    "MATRIX_LR": "0.04",
+    "SCALAR_LR": "0.04",
+    "TIED_EMBED_LR": "0.05",
 }
 ID_DEFAULT = {
-    "VOCAB_SIZE": "1024",
     "MLP_WINDOW": "1024",
     "MLP_OVERLAP": "0.2",
-    "MODEL_DIM": "512",
     "MTP_HEADS": "0",
     "Q_LATENT": "128",
     "KV_LATENT": "64",
@@ -32,9 +35,6 @@ ID_DEFAULT = {
     "ADAPT_RANK": "0",
     "NUM_LAYERS": "9",
     "ATTEND_EVERY": "1",
-    "MATRIX_LR": "0.04",
-    "SCALAR_LR": "0.04",
-    "TIED_EMBED_LR": "0.05",
 }
 DEFAULTS.update(ID_DEFAULT)
 for k, v in DEFAULTS.items():
