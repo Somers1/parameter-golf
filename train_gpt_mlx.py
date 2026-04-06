@@ -505,8 +505,8 @@ class GPT(nn.Module):
             logits_mtp = self.softcap(head(x_mtp))
             mtp_loss = mtp_loss + nn.losses.cross_entropy(logits_mtp.astype(mx.float32), y_mtp, reduction="mean")
 
-        num_losses = 1 + len(self.mtp_heads)
-        return main_loss + mtp_loss / float(num_losses)
+        mtp_weight = 0.3  # auxiliary loss weight — main loss dominates
+        return main_loss + mtp_weight * mtp_loss / float(len(self.mtp_heads))
 
 # ==============================================================================
 # OPTIMIZERS (MUON + ADAM SPLIT)
