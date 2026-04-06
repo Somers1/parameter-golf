@@ -362,7 +362,6 @@ class Block(nn.Module):
         num_heads: int,
         num_kv_heads: int,
         shared_mlp: SharedMLP,
-        mlp_mult: int,
         rope_base: float,
         qk_gain_init: float,
         gate_rank: int = 32,
@@ -371,7 +370,7 @@ class Block(nn.Module):
         self.attn_norm = RMSNormNoWeight()
         self.mlp_norm = RMSNormNoWeight()
         self.attn = CausalSelfAttention(dim, num_heads, num_kv_heads, rope_base, qk_gain_init)
-        self.mlp = shared_mlp
+        self._shared_mlp = shared_mlp  # underscore: not owned, won't appear in tree_flatten
         self.attn_scale = mx.ones((dim,), dtype=mx.float32)
         self.mlp_scale = mx.ones((dim,), dtype=mx.float32)
         self.resid_mix = mx.array(np.stack((np.ones((dim,), dtype=np.float32), np.zeros((dim,), dtype=np.float32))))
@@ -385,13 +384,12 @@ class Block(nn.Module):
         x = mix[0][None, None, :] * x + mix[1][None, None, :] * x0
         attn_out = self.attn(self.attn_norm(x))
         x = x + self.attn_scale.astype(x.dtype)[None, None, :] * attn_out
-        # x = x + self.mlp_scale.astype(x.dtype)[None, None, :] * self.mlp(self.mlp_norm(x))
         normed = self.mlp_norm(x)
-        h = nn.relu(self.shared_mlp.fc(normed))
+        h = nn.relu(self._shared_mlp.fc(normed))
         h = h * h
         gate = mx.sigmoid(self.gate_up(self.gate_down(normed)))
         h = h * gate
-        mlp_out = self.shared_mlp.proj(h)
+        mlp_out = self._shared_mlp.proj(h)
         x = x + self.mlp_scale.astype(x.dtype)[None, None, :] * mlp_out
         return x
 
@@ -415,16 +413,16 @@ class GPT(nn.Module):
         self.num_decoder_layers = num_layers - self.num_encoder_layers
         self.num_skip_weights = min(self.num_encoder_layers, self.num_decoder_layers)
         self.skip_weights = mx.ones((self.num_skip_weights, dim), dtype=mx.float32)
-        shared_mlp = SharedMLP(dim, mlp_mult)
+        self.shared_mlp = SharedMLP(dim, dim * mlp_mult)
         self.blocks = [
-            Block(dim, num_heads, num_kv_heads, shared_mlp, mlp_mult, rope_base, qk_gain_init)
+            Block(dim, num_heads, num_kv_heads, self.shared_mlp, rope_base, qk_gain_init)
             for i in range(num_layers)
         ]
         self.final_norm = RMSNormNoWeight()
 
         for b in self.blocks:
             b.attn.proj.weight = mx.zeros_like(b.attn.proj.weight)
-            b.mlp.proj.weight = mx.zeros_like(b.mlp.proj.weight)
+        self.shared_mlp.proj.weight = mx.zeros_like(self.shared_mlp.proj.weight)
         self.tok_emb.weight = (
             mx.random.normal(self.tok_emb.weight.shape, dtype=mx.float32) * tied_embed_init_std
         ).astype(COMPUTE_DTYPE)
@@ -512,7 +510,7 @@ class SplitOptimizers:
         self.matrix_keys = [
             k
             for k, p in params.items()
-            if k.startswith("blocks.") and p.ndim == 2 and not any(pattern in k for pattern in CONTROL_TENSOR_NAME_PATTERNS)
+            if (k.startswith("blocks.") or k.startswith("shared_mlp.")) and p.ndim == 2 and not any(pattern in k for pattern in CONTROL_TENSOR_NAME_PATTERNS)
         ]
         self.scalar_keys = [
             k
@@ -1123,5 +1121,12 @@ def main() -> None:
 
 
 if __name__ == "__main__":
-    # Baseline settings for M3 Max (36GB)
+    # Gated Shared MLP v1 — same config as baseline for fair comparison
+    os.environ.setdefault("RUN_ID", "gated_shared_mlp_v1")
+    os.environ.setdefault("ITERATIONS", "2000")
+    os.environ.setdefault("TRAIN_BATCH_TOKENS", "65536")
+    os.environ.setdefault("VAL_LOSS_EVERY", "0")
+    os.environ.setdefault("VAL_BATCH_SIZE", "524288")
+    os.environ.setdefault("TRAIN_LOG_EVERY", "10")
+    os.environ.setdefault("SKIP_QUANTIZE", "1")
     main()
