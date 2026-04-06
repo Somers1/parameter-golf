@@ -616,6 +616,10 @@ class CausalSelfAttention(nn.Module):
             raise ValueError("model_dim must be divisible by num_heads")
         if num_heads % num_kv_heads != 0:
             raise ValueError("num_heads must be divisible by num_kv_heads")
+        if q_latent < 0:
+            raise ValueError(f"q_latent must be non-negative, got {q_latent}")
+        if kv_latent < 0:
+            raise ValueError(f"kv_latent must be non-negative, got {kv_latent}")
         self.num_heads = num_heads
         self.num_kv_heads = num_kv_heads
         self.head_dim = dim // num_heads
@@ -623,12 +627,22 @@ class CausalSelfAttention(nn.Module):
             raise ValueError("head_dim must be even for RoPE")
         kv_dim = self.num_kv_heads * self.head_dim
 
-        # MLA: low-rank Q/KV projections
-        self.q_down = CastedLinear(dim, q_latent, bias=False)
-        self.q_up = CastedLinear(q_latent, dim, bias=False)
-        self.kv_down = CastedLinear(dim, kv_latent, bias=False)
-        self.k_up = CastedLinear(kv_latent, kv_dim, bias=False)
-        self.v_up = CastedLinear(kv_latent, kv_dim, bias=False)
+        # Low-rank Q/KV projections are optional; latent rank 0 falls back to full projections.
+        self.has_q_latent = q_latent > 0
+        if self.has_q_latent:
+            self.q_down = CastedLinear(dim, q_latent, bias=False)
+            self.q_up = CastedLinear(q_latent, dim, bias=False)
+        else:
+            self.q_proj = CastedLinear(dim, dim, bias=False)
+
+        self.has_kv_latent = kv_latent > 0
+        if self.has_kv_latent:
+            self.kv_down = CastedLinear(dim, kv_latent, bias=False)
+            self.k_up = CastedLinear(kv_latent, kv_dim, bias=False)
+            self.v_up = CastedLinear(kv_latent, kv_dim, bias=False)
+        else:
+            self.k_proj = CastedLinear(dim, kv_dim, bias=False)
+            self.v_proj = CastedLinear(dim, kv_dim, bias=False)
 
         self.proj = CastedLinear(dim, dim, bias=False)
         self.proj._zero_init = True
@@ -637,10 +651,21 @@ class CausalSelfAttention(nn.Module):
 
     def forward(self, x: Tensor) -> Tensor:
         bsz, seqlen, dim = x.shape
-        kv = self.kv_down(x)
-        q = self.q_up(self.q_down(x)).reshape(bsz, seqlen, self.num_heads, self.head_dim).transpose(1, 2)
-        k = self.k_up(kv).reshape(bsz, seqlen, self.num_kv_heads, self.head_dim).transpose(1, 2)
-        v = self.v_up(kv).reshape(bsz, seqlen, self.num_kv_heads, self.head_dim).transpose(1, 2)
+        if self.has_q_latent:
+            q = self.q_up(self.q_down(x))
+        else:
+            q = self.q_proj(x)
+        q = q.reshape(bsz, seqlen, self.num_heads, self.head_dim).transpose(1, 2)
+
+        if self.has_kv_latent:
+            kv = self.kv_down(x)
+            k = self.k_up(kv)
+            v = self.v_up(kv)
+        else:
+            k = self.k_proj(x)
+            v = self.v_proj(x)
+        k = k.reshape(bsz, seqlen, self.num_kv_heads, self.head_dim).transpose(1, 2)
+        v = v.reshape(bsz, seqlen, self.num_kv_heads, self.head_dim).transpose(1, 2)
         q = F.rms_norm(q, (q.size(-1),))
         k = F.rms_norm(k, (k.size(-1),))
         cos, sin = self.rotary(seqlen, x.device, q.dtype)
