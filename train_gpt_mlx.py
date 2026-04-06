@@ -26,6 +26,15 @@ import mlx.nn as nn
 import mlx.optimizers as optim
 from mlx.utils import tree_flatten, tree_unflatten
 
+
+os.environ.setdefault("RUN_ID", "shared_gated_mlp")
+os.environ.setdefault("ITERATIONS", "2000")
+os.environ.setdefault("TRAIN_BATCH_TOKENS", "65536")
+os.environ.setdefault("VAL_LOSS_EVERY", "0")
+os.environ.setdefault("VAL_BATCH_SIZE", "524288")
+os.environ.setdefault("TRAIN_LOG_EVERY", "50")
+os.environ.setdefault("SKIP_QUANTIZE", "1")
+
 # ==============================================================================
 # SHARD FORMAT + COMPUTE DTYPE
 # ==============================================================================
@@ -338,17 +347,12 @@ class CausalSelfAttention(nn.Module):
         return self.proj(y)
 
 
-class MLP(nn.Module):
-    # Baseline MLP uses relu^2 instead of GELU/SiLU. It is cheap and works well in this setup.
-    def __init__(self, dim: int, mlp_mult: int):
+class SharedMLP(nn.Module):
+    def __init__(self, dim, hidden):
         super().__init__()
-        hidden = dim * mlp_mult
         self.fc = CastedLinear(dim, hidden)
         self.proj = CastedLinear(hidden, dim)
 
-    def __call__(self, x: mx.array) -> mx.array:
-        x = nn.relu(self.fc(x))
-        return self.proj(x * x)
 
 
 class Block(nn.Module):
@@ -357,25 +361,38 @@ class Block(nn.Module):
         dim: int,
         num_heads: int,
         num_kv_heads: int,
+        shared_mlp: SharedMLP,
         mlp_mult: int,
         rope_base: float,
         qk_gain_init: float,
+        gate_rank: int = 32,
     ):
         super().__init__()
         self.attn_norm = RMSNormNoWeight()
         self.mlp_norm = RMSNormNoWeight()
         self.attn = CausalSelfAttention(dim, num_heads, num_kv_heads, rope_base, qk_gain_init)
-        self.mlp = MLP(dim, mlp_mult)
+        self.mlp = shared_mlp
         self.attn_scale = mx.ones((dim,), dtype=mx.float32)
         self.mlp_scale = mx.ones((dim,), dtype=mx.float32)
         self.resid_mix = mx.array(np.stack((np.ones((dim,), dtype=np.float32), np.zeros((dim,), dtype=np.float32))))
+
+        hidden = shared_mlp.fc.weight.shape[0]
+        self.gate_down = CastedLinear(dim, gate_rank)
+        self.gate_up = CastedLinear(gate_rank, hidden)
 
     def __call__(self, x: mx.array, x0: mx.array) -> mx.array:
         mix = self.resid_mix.astype(x.dtype)
         x = mix[0][None, None, :] * x + mix[1][None, None, :] * x0
         attn_out = self.attn(self.attn_norm(x))
         x = x + self.attn_scale.astype(x.dtype)[None, None, :] * attn_out
-        x = x + self.mlp_scale.astype(x.dtype)[None, None, :] * self.mlp(self.mlp_norm(x))
+        # x = x + self.mlp_scale.astype(x.dtype)[None, None, :] * self.mlp(self.mlp_norm(x))
+        normed = self.mlp_norm(x)
+        h = nn.relu(self.shared_mlp.fc(normed))
+        h = h * h
+        gate = mx.sigmoid(self.gate_up(self.gate_down(normed)))
+        h = h * gate
+        mlp_out = self.shared_mlp.proj(h)
+        x = x + self.mlp_scale.astype(x.dtype)[None, None, :] * mlp_out
         return x
 
 
@@ -398,8 +415,9 @@ class GPT(nn.Module):
         self.num_decoder_layers = num_layers - self.num_encoder_layers
         self.num_skip_weights = min(self.num_encoder_layers, self.num_decoder_layers)
         self.skip_weights = mx.ones((self.num_skip_weights, dim), dtype=mx.float32)
+        shared_mlp = SharedMLP(dim, mlp_mult)
         self.blocks = [
-            Block(dim, num_heads, num_kv_heads, mlp_mult, rope_base, qk_gain_init)
+            Block(dim, num_heads, num_kv_heads, shared_mlp, mlp_mult, rope_base, qk_gain_init)
             for i in range(num_layers)
         ]
         self.final_norm = RMSNormNoWeight()
@@ -1106,11 +1124,4 @@ def main() -> None:
 
 if __name__ == "__main__":
     # Baseline settings for M3 Max (36GB)
-    os.environ.setdefault("RUN_ID", "baseline_proper")
-    os.environ.setdefault("ITERATIONS", "2000")
-    os.environ.setdefault("TRAIN_BATCH_TOKENS", "65536")
-    os.environ.setdefault("VAL_LOSS_EVERY", "500")
-    os.environ.setdefault("VAL_BATCH_SIZE", "524288")
-    os.environ.setdefault("TRAIN_LOG_EVERY", "50")
-    os.environ.setdefault("SKIP_QUANTIZE", "1")
     main()
