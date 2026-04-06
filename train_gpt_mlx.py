@@ -36,7 +36,7 @@ DEFAULTS = {
     "SKIP_QUANTIZE": "1",
 }
 ID_DEFAULT = {
-    "MLP_WINDOW": "1028",
+    "MLP_WINDOW": "1024",
     "MLP_OVERLAP": "0.5",
     "MODEL_DIM": "512",
     "MTP_HEADS": "1",
