@@ -361,7 +361,6 @@ class CausalSelfAttention(nn.Module):
     def __call__(self, x: mx.array) -> mx.array:
         bsz, seqlen, dim = x.shape
         kv_latent = self.kv_down(x)
-        v = self.v_up(kv_latent)
         q = self.q_up(self.q_down(x)).reshape(bsz, seqlen, self.num_heads, self.head_dim).transpose(0, 2, 1, 3)
         k = self.k_up(kv_latent).reshape(bsz, seqlen, self.num_kv_heads, self.head_dim).transpose(0, 2, 1, 3)
         v = self.v_up(kv_latent).reshape(bsz, seqlen, self.num_kv_heads, self.head_dim).transpose(0, 2, 1, 3)
@@ -997,7 +996,9 @@ def main() -> None:
     )
 
     # Print config once so logs are self-describing.
-    n_params = sum(int(np.prod(p.shape)) for _, p in tree_flatten(model.parameters()))
+    all_params = sum(int(np.prod(p.shape)) for _, p in tree_flatten(model.parameters()))
+    mtp_params = sum(int(np.prod(p.shape)) for k, p in tree_flatten(model.parameters()) if k.startswith("mtp_heads."))
+    n_params = all_params - mtp_params
     log(f"run_id:{args.run_id}")
     log(f"mlx_version:{mx.__version__}")
     log(f"train_loader:shards pattern={args.train_files}")
@@ -1014,7 +1015,7 @@ def main() -> None:
         log(f"train_loader:dataset:{dataset_name} train_shards:{actual_train_files}/{expected_train_files}")
     log(f"tokenizer_path:{args.tokenizer_path}")
     log(
-        f"model_params:{n_params} vocab_size:{args.vocab_size} layers:{args.num_layers} "
+        f"model_params:{n_params} (mtp_heads:{mtp_params}) vocab_size:{args.vocab_size} layers:{args.num_layers} "
         f"dim:{args.model_dim} heads:{args.num_heads} kv_heads:{args.num_kv_heads} "
         f"seq_len:{args.train_seq_len} tie_embeddings:{args.tie_embeddings}"
     )
