@@ -40,8 +40,9 @@ DEFAULTS = {
     "MAX_WALLCLOCK_SECONDS": "0"
 }
 ID_DEFAULT = {
-    "MLP_WINDOW": "2048",
-    "MLP_OVERLAP": "0.5",
+    "VOCAB_SIZE": "1024",
+    "MLP_WINDOW": "1024",
+    "MLP_OVERLAP": "0.7",
     "MODEL_DIM": "512",
     "MTP_HEADS": "1",
     "Q_LATENT": "128",
@@ -53,6 +54,11 @@ ID_DEFAULT = {
 DEFAULTS.update(ID_DEFAULT)
 for k, v in DEFAULTS.items():
     os.environ.setdefault(k, v)
+
+# Auto-set data/tokenizer paths based on VOCAB_SIZE
+_vocab = os.environ.get("VOCAB_SIZE", "1024")
+os.environ.setdefault("DATA_PATH", f"./data/datasets/fineweb10B_sp{_vocab}")
+os.environ.setdefault("TOKENIZER_PATH", f"./data/tokenizers/fineweb_{_vocab}_bpe.model")
 
 os.environ.setdefault(
     "RUN_ID",
