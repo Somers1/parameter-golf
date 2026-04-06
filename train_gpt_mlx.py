@@ -488,6 +488,7 @@ class GPT(nn.Module):
         y_flat = target_ids.reshape(-1)
         logits = self.softcap(x_flat @ emb_w.T)
         main_loss = nn.losses.cross_entropy(logits.astype(mx.float32), y_flat, reduction="mean")
+        self._main_loss = main_loss  # store for logging
 
         if not self.mtp_heads:
             return main_loss
@@ -1122,6 +1123,7 @@ def main() -> None:
         grads = tree_unflatten(list(accum.items()))
         grads = clip_grad_tree(grads, args.grad_clip_norm)
         train_loss_value = float(train_loss.item())
+        main_loss_value = float(model._main_loss.item()) if hasattr(model, '_main_loss') else train_loss_value
         opt.step(model, grads, step=step, lr_mul=lr_mul)
         mx.synchronize()
 
@@ -1131,7 +1133,7 @@ def main() -> None:
         step += 1
         if args.train_log_every > 0 and (step <= 10 or step % args.train_log_every == 0 or stop_after_step is not None):
             log(
-                f"step:{step}/{args.iterations} train_loss:{train_loss_value:.4f} "
+                f"step:{step}/{args.iterations} loss:{main_loss_value:.4f} total:{train_loss_value:.4f} "
                 f"train_time:{approx_train_time_ms:.0f}ms step_avg:{approx_train_time_ms / step:.2f}ms tok_s:{tok_s:.0f}"
             )
         if max_wallclock_ms is not None and stop_after_step is None and approx_train_time_ms >= max_wallclock_ms:
