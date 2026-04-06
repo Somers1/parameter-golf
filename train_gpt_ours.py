@@ -16,7 +16,7 @@ DEFAULTS = {
     "TRAIN_BATCH_TOKENS": "524288",
     "VAL_LOSS_EVERY": "1000",
     "VAL_BATCH_SIZE": "524288",
-    "TRAIN_LOG_EVERY": "200",
+    "TRAIN_LOG_EVERY": "500",
     "TRAIN_SEQ_LEN": "1024",
     "MAX_WALLCLOCK_SECONDS": "600",
 }
@@ -794,7 +794,7 @@ class GPT(nn.Module):
             logits_mtp = self.logit_softcap * torch.tanh(head(x_mtp) / self.logit_softcap)
             mtp_loss = mtp_loss + F.cross_entropy(logits_mtp.float(), y_mtp, reduction="mean")
 
-        mtp_weight = 0.3
+        mtp_weight = 0.05
         return main_loss + mtp_weight * mtp_loss / float(len(self.mtp_head_list))
 
 
