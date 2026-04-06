@@ -1101,4 +1101,11 @@ def main() -> None:
 
 
 if __name__ == "__main__":
+    # Baseline settings for M3 Max (36GB)
+    os.environ.setdefault("RUN_ID", "baseline_proper")
+    os.environ.setdefault("ITERATIONS", "2000")
+    os.environ.setdefault("TRAIN_BATCH_TOKENS", "65536")
+    os.environ.setdefault("VAL_LOSS_EVERY", "500")
+    os.environ.setdefault("VAL_BATCH_SIZE", "524288")
+    os.environ.setdefault("TRAIN_LOG_EVERY", "50")
     main()
