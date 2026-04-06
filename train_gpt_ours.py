@@ -677,9 +677,11 @@ class Block(nn.Module):
         self.mlp_scale = nn.Parameter(torch.ones(dim, dtype=torch.float32))
         self.resid_mix = nn.Parameter(torch.stack((torch.ones(dim), torch.zeros(dim))).float())
 
-        # Per-layer gate adapter
-        self.gate_down = CastedLinear(dim, gate_rank, bias=False)
-        self.gate_up = CastedLinear(gate_rank, mlp_window, bias=False)
+        # Per-layer gate adapter (optional)
+        self.has_gate = gate_rank > 0
+        if self.has_gate:
+            self.gate_down = CastedLinear(dim, gate_rank, bias=False)
+            self.gate_up = CastedLinear(gate_rank, mlp_window, bias=False)
 
     def forward(self, x: Tensor, x0: Tensor, shared_mlp: SharedMLP) -> Tensor:
         mix = self.resid_mix.to(dtype=x.dtype)
@@ -693,8 +695,9 @@ class Block(nn.Module):
         fc_w = shared_mlp.fc.weight[self.mlp_start:self.mlp_end, :].to(normed.dtype)
         h = torch.relu(F.linear(normed, fc_w))
         h = h.square()
-        gate = torch.sigmoid(self.gate_up(self.gate_down(normed)))
-        h = h * gate
+        if self.has_gate:
+            gate = torch.sigmoid(self.gate_up(self.gate_down(normed)))
+            h = h * gate
         proj_w = shared_mlp.proj.weight[:, self.mlp_start:self.mlp_end].to(h.dtype)
         mlp_out = F.linear(h, proj_w)
         x = x + self.mlp_scale.to(dtype=x.dtype)[None, None, :] * mlp_out
