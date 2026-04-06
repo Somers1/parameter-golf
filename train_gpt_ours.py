@@ -744,8 +744,6 @@ class Block(nn.Module):
         h = F.linear(normed, fc_w)
         if self.has_adapt:
             h = h + self.adapt_up_B(self.adapt_up_A(normed))
-        if self.shared_h_norm is not None:
-            h = self.shared_h_norm(h)
         h = torch.relu(h).square()
         if self.has_gate:
             gate = torch.tanh(self.gate_up(self.gate_down(normed)))
