@@ -90,6 +90,7 @@ class Hyperparameters:
     logit_softcap: float = float(os.environ.get("LOGIT_SOFTCAP", 30.0))
     rope_base: float = float(os.environ.get("ROPE_BASE", 10000.0))
     qk_gain_init: float = float(os.environ.get("QK_GAIN_INIT", 1.5))
+    mtp_heads: int = int(os.environ.get("MTP_HEADS", 3))
 
     # Optimizer. We keep the same per-group defaults as train_gpt.py.
     beta1: float = float(os.environ.get("BETA1", 0.9))
@@ -402,7 +403,7 @@ class GPT(nn.Module):
     # - tied embeddings for the LM head (the baseline default setup)
     def __init__(self, vocab_size: int, num_layers: int, dim: int, num_heads: int, num_kv_heads: int, mlp_mult: int,
                  logit_chunk_tokens: int, logit_softcap: float, rope_base: float, tied_embed_init_std: float,
-                 qk_gain_init: float):
+                 qk_gain_init: float, mtp_heads: int = 0):
         super().__init__()
         if logit_softcap <= 0.0:
             raise ValueError(f"logit_softcap must be positive, got {logit_softcap}")
@@ -420,6 +421,7 @@ class GPT(nn.Module):
             for i in range(num_layers)
         ]
         self.final_norm = RMSNormNoWeight()
+        self.mtp_heads = [CastedLinear(dim, vocab_size) for _ in range(mtp_heads)] if mtp_heads > 0 else []
 
         for b in self.blocks:
             b.attn.proj.weight = mx.zeros_like(b.attn.proj.weight)
@@ -450,23 +452,34 @@ class GPT(nn.Module):
         return self.final_norm(x)
 
     def loss(self, input_ids: mx.array, target_ids: mx.array) -> mx.array:
-        # Cross-entropy over flattened tokens. We keep optional logit chunking because it is a useful
-        # memory knob on Macs, but the common path is chunk_tokens=0 (single matmul + CE).
-        x = self(input_ids).reshape(-1, self.tok_emb.weight.shape[1])
-        y = target_ids.reshape(-1)
-        if self.logit_chunk_tokens <= 0 or x.shape[0] <= self.logit_chunk_tokens:
-            logits_proj = x @ self.tok_emb.weight.astype(x.dtype).T
-            logits = self.softcap(logits_proj)
-            return nn.losses.cross_entropy(logits.astype(mx.float32), y, reduction="mean")
+        x = self(input_ids)
+        bsz, seq_len, dim = x.shape
+        emb_w = self.tok_emb.weight.astype(x.dtype)
 
-        loss_sum = mx.array(0.0, dtype=mx.float32)
-        n = int(x.shape[0])
-        for s in range(0, n, self.logit_chunk_tokens):
-            e = min(s + self.logit_chunk_tokens, n)
-            logits_proj = x[s:e] @ self.tok_emb.weight.astype(x.dtype).T
-            logits = self.softcap(logits_proj)
-            loss_sum = loss_sum + nn.losses.cross_entropy(logits.astype(mx.float32), y[s:e], reduction="sum")
-        return loss_sum / float(n)
+        # Main next-token prediction loss (same as baseline)
+        x_flat = x.reshape(-1, dim)
+        y_flat = target_ids.reshape(-1)
+        logits = self.softcap(x_flat @ emb_w.T)
+        main_loss = nn.losses.cross_entropy(logits.astype(mx.float32), y_flat, reduction="mean")
+
+        if not self.mtp_heads:
+            return main_loss
+
+        # Multi-token prediction: extra heads predict N+2, N+3, ... tokens ahead
+        # These heads are discarded after training — they don't count toward 16MB
+        mtp_loss = mx.array(0.0, dtype=mx.float32)
+        for i, head in enumerate(self.mtp_heads):
+            offset = i + 2  # head 0 predicts +2, head 1 predicts +3, etc.
+            if offset >= seq_len:
+                continue
+            # Use hidden states up to (seq_len - offset) to predict tokens at (offset) onwards
+            x_mtp = x[:, :seq_len - offset, :].reshape(-1, dim)
+            y_mtp = target_ids[:, offset:].reshape(-1)
+            logits_mtp = self.softcap(head(x_mtp))
+            mtp_loss = mtp_loss + nn.losses.cross_entropy(logits_mtp.astype(mx.float32), y_mtp, reduction="mean")
+
+        num_losses = 1 + len(self.mtp_heads)
+        return main_loss + mtp_loss / float(num_losses)
 
 # ==============================================================================
 # OPTIMIZERS (MUON + ADAM SPLIT)
@@ -513,6 +526,7 @@ class SplitOptimizers:
             for k, p in params.items()
             if (k.startswith("blocks.") or k.startswith("shared_mlp.")) and p.ndim == 2 and not any(pattern in k for pattern in CONTROL_TENSOR_NAME_PATTERNS)
         ]
+        self.mtp_keys = [k for k in params if k.startswith("mtp_heads.")]
         self.scalar_keys = [
             k
             for k, p in params.items()
@@ -532,6 +546,13 @@ class SplitOptimizers:
             eps=args.adam_eps,
             bias_correction=True,
         )
+        if self.mtp_keys:
+            self.adam_mtp = optim.Adam(
+                learning_rate=args.scalar_lr,
+                betas=[args.beta1, args.beta2],
+                eps=args.adam_eps,
+                bias_correction=True,
+            )
 
     def step(self, model: GPT, grads_tree: dict, step: int, lr_mul: float) -> None:
         params = dict(tree_flatten(model.parameters()))
@@ -552,6 +573,13 @@ class SplitOptimizers:
         scalar_grads = {k: grads[k] for k in self.scalar_keys}
         scalar_params = {k: params[k] for k in self.scalar_keys}
         updated.update(self.adam_scalar.apply_gradients(scalar_grads, scalar_params))
+
+        if self.mtp_keys:
+            self.adam_mtp.learning_rate = self.args.scalar_lr * lr_mul
+            mtp_grads = {k: grads[k] for k in self.mtp_keys if k in grads}
+            mtp_params = {k: params[k] for k in self.mtp_keys if k in params}
+            if mtp_grads:
+                updated.update(self.adam_mtp.apply_gradients(mtp_grads, mtp_params))
 
         model.update(tree_unflatten(list(updated.items())))
 
@@ -919,6 +947,7 @@ def main() -> None:
         rope_base=args.rope_base,
         tied_embed_init_std=args.tied_embed_init_std,
         qk_gain_init=args.qk_gain_init,
+        mtp_heads=args.mtp_heads,
     )
     opt = SplitOptimizers(model, args)
 
@@ -1086,14 +1115,26 @@ def main() -> None:
     # model and running one final validation pass.
     out_path = out_dir / f"{args.run_id}_mlx_model.npz"
     flat_state = {k: v for k, v in tree_flatten(model.state)}
-    mx.savez(str(out_path), **flat_state)
+    # Strip MTP heads (training-only, not part of final artifact) and deduplicate
+    # shared MLP weights that may appear under both shared_mlp.* and blocks.*.
+    save_state = {}
+    seen_ids = set()
+    for k, v in flat_state.items():
+        if k.startswith("mtp_heads."):
+            continue
+        arr_id = id(v)
+        if arr_id in seen_ids:
+            continue
+        seen_ids.add(arr_id)
+        save_state[k] = v
+    mx.savez(str(out_path), **save_state)
     log(f"saved_model:{out_path} bytes:{out_path.stat().st_size}")
 
     if bool(int(os.environ.get("SKIP_QUANTIZE", "0"))):
         log("skipping quantized roundtrip (SKIP_QUANTIZE=1)")
         return
 
-    quant_obj, quant_stats = quantize_state_dict_int8(flat_state)
+    quant_obj, quant_stats = quantize_state_dict_int8(save_state)
     quant_raw = pickle.dumps(quant_obj, protocol=pickle.HIGHEST_PROTOCOL)
     quant_blob = zlib.compress(quant_raw, level=9)
     quant_serialized_bytes = len(quant_raw)
