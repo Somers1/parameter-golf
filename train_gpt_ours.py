@@ -6,11 +6,54 @@ Hard stop: To keep readable for newcomers, let's make sure `train_gpt.py` and `t
 
 from __future__ import annotations
 
+import os
+
+# ============================================================
+# DEFAULTS — edit these to tune, env vars still override
+# ============================================================
+DEFAULTS = {
+    "ITERATIONS": "20000",
+    "TRAIN_BATCH_TOKENS": "524288",
+    "VAL_LOSS_EVERY": "1000",
+    "VAL_BATCH_SIZE": "524288",
+    "TRAIN_LOG_EVERY": "50",
+    "TRAIN_SEQ_LEN": "1024",
+    "MAX_WALLCLOCK_SECONDS": "600",
+}
+ID_DEFAULT = {
+    "VOCAB_SIZE": "1024",
+    "MLP_WINDOW": "2048",
+    "MLP_OVERLAP": "0.5",
+    "MODEL_DIM": "512",
+    "MTP_HEADS": "1",
+    "Q_LATENT": "128",
+    "KV_LATENT": "64",
+    "GATE_RANK": "32",
+    "NUM_LAYERS": "12",
+    "ATTEND_EVERY": "2",
+    "MATRIX_LR": "0.04",
+    "SCALAR_LR": "0.04",
+    "TIED_EMBED_LR": "0.05",
+}
+DEFAULTS.update(ID_DEFAULT)
+for k, v in DEFAULTS.items():
+    os.environ.setdefault(k, v)
+
+os.environ.setdefault(
+    "RUN_ID",
+    "ours_" + "_".join(f"{k.lower()}{os.environ[k]}" for k in ID_DEFAULT.keys()),
+)
+
+# Auto-set data/tokenizer paths based on VOCAB_SIZE
+_vocab = os.environ.get("VOCAB_SIZE", "1024")
+os.environ.setdefault("DATA_PATH", f"./data/datasets/fineweb10B_sp{_vocab}")
+os.environ.setdefault("TOKENIZER_PATH", f"./data/tokenizers/fineweb_{_vocab}_bpe.model")
+# ============================================================
+
 import copy
 import glob
 import io
 import math
-import os
 import random
 import subprocess
 import sys
