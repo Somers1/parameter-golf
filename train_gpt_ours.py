@@ -16,7 +16,7 @@ DEFAULTS = {
     "TRAIN_BATCH_TOKENS": "524288",
     "VAL_LOSS_EVERY": "1000",
     "VAL_BATCH_SIZE": "524288",
-    "TRAIN_LOG_EVERY": "50",
+    "TRAIN_LOG_EVERY": "200",
     "TRAIN_SEQ_LEN": "1024",
     "MAX_WALLCLOCK_SECONDS": "600",
 }
@@ -143,9 +143,9 @@ class Hyperparameters:
     grad_clip_norm = float(os.environ.get("GRAD_CLIP_NORM", 0.0))
 
 # -----------------------------
-# MUON OPTIMIZER 
+# MUON OPTIMIZER
 # -----------------------------
-# 
+#
 # As borrowed from modded-nanogpt
 # Background on Muon: https://kellerjordan.github.io/posts/muon/
 
@@ -225,7 +225,7 @@ class Muon(torch.optim.Optimizer):
 
 
 # -----------------------------
-# TOKENIZER-AGNOSTIC EVALUATION SETUP 
+# TOKENIZER-AGNOSTIC EVALUATION SETUP
 # -----------------------------
 #
 # It's common for small models have a large fraction of their parameters be embeddings, since the 2 * d_model * d_vocab vectors can be gigantic.
@@ -479,7 +479,7 @@ def dequantize_state_dict_int8(obj: dict[str, object]) -> dict[str, Tensor]:
 
 
 # -----------------------------
-# DATA LOADING 
+# DATA LOADING
 # -----------------------------
 
 def load_data_shard(file: Path) -> Tensor:
