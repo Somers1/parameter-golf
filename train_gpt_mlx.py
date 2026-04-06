@@ -41,8 +41,8 @@ DEFAULTS = {
 }
 ID_DEFAULT = {
     "VOCAB_SIZE": "1024",
-    "MLP_WINDOW": "1024",
-    "MLP_OVERLAP": "0.7",
+    "MLP_WINDOW": "2048",
+    "MLP_OVERLAP": "0.5",
     "MODEL_DIM": "512",
     "MTP_HEADS": "1",
     "Q_LATENT": "128",
