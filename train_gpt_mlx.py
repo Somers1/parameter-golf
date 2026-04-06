@@ -36,7 +36,8 @@ DEFAULTS = {
     "SKIP_QUANTIZE": "1",
 }
 ID_DEFAULT = {
-    "MLP_MULT": "8",
+    "MLP_WINDOW": "2048",
+    "MLP_OVERLAP": "0.5",
     "MODEL_DIM": "512",
     "MTP_HEADS": "1",
     "Q_LATENT": "128",
@@ -454,9 +455,8 @@ class Block(nn.Module):
             )
         )
 
-        hidden = shared_mlp.fc.weight.shape[0]
         self.gate_down = CastedLinear(dim, gate_rank)
-        self.gate_up = CastedLinear(gate_rank, hidden)
+        self.gate_up = CastedLinear(gate_rank, mlp_window)
 
     def __call__(self, x: mx.array, x0: mx.array) -> mx.array:
         mix = self.resid_mix.astype(x.dtype)
