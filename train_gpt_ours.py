@@ -29,6 +29,7 @@ ID_DEFAULT = {
     "Q_LATENT": "128",
     "KV_LATENT": "64",
     "GATE_RANK": "32",
+    "ADAPT_RANK": "0",
     "NUM_LAYERS": "9",
     "ATTEND_EVERY": "1",
     "MATRIX_LR": "0.04",
@@ -117,6 +118,7 @@ class Hyperparameters:
     mlp_window = int(os.environ.get("MLP_WINDOW", 2048))
     mlp_overlap = float(os.environ.get("MLP_OVERLAP", 0.5))
     gate_rank = int(os.environ.get("GATE_RANK", 32))
+    adapt_rank = int(os.environ.get("ADAPT_RANK", 0))
     attend_every = int(os.environ.get("ATTEND_EVERY", 2))
 
     # MLA (Multi-head Latent Attention).
@@ -662,7 +664,8 @@ class SharedMLP(nn.Module):
 class Block(nn.Module):
     def __init__(self, dim: int, num_heads: int, num_kv_heads: int, rope_base: float,
                  qk_gain_init: float, q_latent: int, kv_latent: int, gate_rank: int,
-                 layer_idx: int, mlp_window: int, mlp_stride: int, has_attention: bool = True):
+                 adapt_rank: int, layer_idx: int, mlp_window: int, mlp_stride: int,
+                 has_attention: bool = True):
         super().__init__()
         self.has_attention = has_attention
         if has_attention:
@@ -683,6 +686,15 @@ class Block(nn.Module):
             self.gate_down = CastedLinear(dim, gate_rank, bias=False)
             self.gate_up = CastedLinear(gate_rank, mlp_window, bias=False)
 
+        # Per-layer LoRA adapters on shared MLP (optional)
+        self.has_adapt = adapt_rank > 0
+        if self.has_adapt:
+            self.adapt_up_A = CastedLinear(dim, adapt_rank, bias=False)
+            self.adapt_up_B = CastedLinear(adapt_rank, mlp_window, bias=False)
+            self.adapt_down_A = CastedLinear(mlp_window, adapt_rank, bias=False)
+            self.adapt_down_B = CastedLinear(adapt_rank, dim, bias=False)
+            self.adapt_down_B._zero_init = True
+
     def forward(self, x: Tensor, x0: Tensor, shared_mlp: SharedMLP) -> Tensor:
         mix = self.resid_mix.to(dtype=x.dtype)
         x = mix[0][None, None, :] * x + mix[1][None, None, :] * x0
@@ -693,13 +705,17 @@ class Block(nn.Module):
 
         normed = self.mlp_norm(x)
         fc_w = shared_mlp.fc.weight[self.mlp_start:self.mlp_end, :].to(normed.dtype)
-        h = torch.relu(F.linear(normed, fc_w))
-        h = h.square()
+        h = F.linear(normed, fc_w)
+        if self.has_adapt:
+            h = h + self.adapt_up_B(self.adapt_up_A(normed))
+        h = torch.relu(h).square()
         if self.has_gate:
             gate = torch.sigmoid(self.gate_up(self.gate_down(normed)))
             h = h * gate
         proj_w = shared_mlp.proj.weight[:, self.mlp_start:self.mlp_end].to(h.dtype)
         mlp_out = F.linear(h, proj_w)
+        if self.has_adapt:
+            mlp_out = mlp_out + self.adapt_down_B(self.adapt_down_A(h))
         x = x + self.mlp_scale.to(dtype=x.dtype)[None, None, :] * mlp_out
         return x
 
@@ -708,8 +724,8 @@ class GPT(nn.Module):
     def __init__(self, vocab_size: int, num_layers: int, model_dim: int, num_heads: int,
                  num_kv_heads: int, mlp_mult: int, tie_embeddings: bool, tied_embed_init_std: float,
                  logit_softcap: float, rope_base: float, qk_gain_init: float,
-                 mlp_window: int, mlp_overlap: float, gate_rank: int, attend_every: int,
-                 q_latent: int, kv_latent: int, mtp_heads: int):
+                 mlp_window: int, mlp_overlap: float, gate_rank: int, adapt_rank: int,
+                 attend_every: int, q_latent: int, kv_latent: int, mtp_heads: int):
         super().__init__()
         if logit_softcap <= 0.0:
             raise ValueError(f"logit_softcap must be positive, got {logit_softcap}")
@@ -730,7 +746,7 @@ class GPT(nn.Module):
 
         self.blocks = nn.ModuleList([
             Block(model_dim, num_heads, num_kv_heads, rope_base, qk_gain_init,
-                  q_latent, kv_latent, gate_rank,
+                  q_latent, kv_latent, gate_rank, adapt_rank,
                   layer_idx=i, mlp_window=mlp_window, mlp_stride=mlp_stride,
                   has_attention=(i % attend_every == 0))
             for i in range(num_layers)
@@ -912,6 +928,7 @@ def main() -> None:
         mlp_window=args.mlp_window,
         mlp_overlap=args.mlp_overlap,
         gate_rank=args.gate_rank,
+        adapt_rank=args.adapt_rank,
         attend_every=args.attend_every,
         q_latent=args.q_latent,
         kv_latent=args.kv_latent,
