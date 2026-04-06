@@ -691,6 +691,7 @@ class Block(nn.Module):
         if self.has_adapt:
             self.adapt_up_A = CastedLinear(dim, adapt_rank, bias=False)
             self.adapt_up_B = CastedLinear(adapt_rank, mlp_window, bias=False)
+            self.adapt_up_B._zero_init = True
             self.adapt_down_A = CastedLinear(mlp_window, adapt_rank, bias=False)
             self.adapt_down_B = CastedLinear(adapt_rank, dim, bias=False)
             self.adapt_down_B._zero_init = True
