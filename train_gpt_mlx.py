@@ -1067,6 +1067,10 @@ def main() -> None:
     mx.savez(str(out_path), **flat_state)
     log(f"saved_model:{out_path} bytes:{out_path.stat().st_size}")
 
+    if bool(int(os.environ.get("SKIP_QUANTIZE", "0"))):
+        log("skipping quantized roundtrip (SKIP_QUANTIZE=1)")
+        return
+
     quant_obj, quant_stats = quantize_state_dict_int8(flat_state)
     quant_raw = pickle.dumps(quant_obj, protocol=pickle.HIGHEST_PROTOCOL)
     quant_blob = zlib.compress(quant_raw, level=9)
@@ -1108,4 +1112,5 @@ if __name__ == "__main__":
     os.environ.setdefault("VAL_LOSS_EVERY", "500")
     os.environ.setdefault("VAL_BATCH_SIZE", "524288")
     os.environ.setdefault("TRAIN_LOG_EVERY", "50")
+    os.environ.setdefault("SKIP_QUANTIZE", "1")
     main()
