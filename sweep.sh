@@ -21,7 +21,7 @@ export SCALAR_LR=0.04
 export TIED_EMBED_LR=0.05
 export TRAIN_LOG_EVERY=50
 export VAL_LOSS_EVERY=0
-export MAX_WALLCLOCK_SECONDS=600
+export MAX_WALLCLOCK_SECONDS=180
 
 # Detect GPU count
 if command -v nvidia-smi &> /dev/null; then
