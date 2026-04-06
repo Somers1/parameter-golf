@@ -37,13 +37,13 @@ DEFAULTS = {
 }
 ID_DEFAULT = {
     "MLP_WINDOW": "1024",
-    "MLP_OVERLAP": "0.5",
+    "MLP_OVERLAP": "0.7",
     "MODEL_DIM": "512",
     "MTP_HEADS": "1",
     "Q_LATENT": "128",
     "KV_LATENT": "64",
     "GATE_RANK": "32",
-    "NUM_LAYERS": "8",
+    "NUM_LAYERS": "4",
     "ATTEND_EVERY": "2",
 }
 DEFAULTS.update(ID_DEFAULT)
