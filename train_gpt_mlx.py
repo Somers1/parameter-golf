@@ -36,14 +36,15 @@ DEFAULTS = {
     "SKIP_QUANTIZE": "1",
 }
 ID_DEFAULT = {
-    "MLP_WINDOW": "2048",
+    "MLP_WINDOW": "1028",
     "MLP_OVERLAP": "0.5",
     "MODEL_DIM": "512",
     "MTP_HEADS": "1",
     "Q_LATENT": "128",
     "KV_LATENT": "64",
     "GATE_RANK": "32",
-    "NUM_LAYERS": "4",
+    "NUM_LAYERS": "8",
+    "ATTEND_EVERY": "2",
 }
 DEFAULTS.update(ID_DEFAULT)
 for k, v in DEFAULTS.items():
@@ -435,19 +436,23 @@ class Block(nn.Module):
         layer_idx,
         mlp_window,
         mlp_stride,
+        has_attention=True
     ):
         super().__init__()
-        self.attn_norm = RMSNormNoWeight()
+        if has_attention:
+            self.attn_norm = RMSNormNoWeight()
+            self.attn = CausalSelfAttention(
+                dim, num_heads, num_kv_heads, rope_base, qk_gain_init, q_latent, kv_latent
+            )
+            self.attn_scale = mx.ones((dim,), dtype=mx.float32)
+        self.has_attention = has_attention
+
         self.mlp_norm = RMSNormNoWeight()
-        self.attn = CausalSelfAttention(
-            dim, num_heads, num_kv_heads, rope_base, qk_gain_init, q_latent, kv_latent
-        )
         self.mlp_start = layer_idx * mlp_stride
         self.mlp_end = self.mlp_start + mlp_window
         self._shared_mlp = (
             shared_mlp  # underscore: not owned, won't appear in tree_flatten
         )
-        self.attn_scale = mx.ones((dim,), dtype=mx.float32)
         self.mlp_scale = mx.ones((dim,), dtype=mx.float32)
         self.resid_mix = mx.array(
             np.stack(
@@ -461,8 +466,9 @@ class Block(nn.Module):
     def __call__(self, x: mx.array, x0: mx.array) -> mx.array:
         mix = self.resid_mix.astype(x.dtype)
         x = mix[0][None, None, :] * x + mix[1][None, None, :] * x0
-        attn_out = self.attn(self.attn_norm(x))
-        x = x + self.attn_scale.astype(x.dtype)[None, None, :] * attn_out
+        if self.has_attention:
+            attn_out = self.attn(self.attn_norm(x))
+            x = x + self.attn_scale.astype(x.dtype)[None, None, :] * attn_out
         normed = self.mlp_norm(x)
         fc_w = self._shared_mlp.fc.weight[self.mlp_start:self.mlp_end, :]  # slice rows
         h = nn.relu(normed @ fc_w.astype(normed.dtype).T)
@@ -525,7 +531,7 @@ class GPT(nn.Module):
                 q_latent,
                 kv_latent,
                 gate_rank,
-                layer_idx=i, mlp_window=mlp_window, mlp_stride=mlp_stride
+                layer_idx=i, mlp_window=mlp_window, mlp_stride=mlp_stride, has_attention=(i % int(os.environ.get('ATTEND_EVERY', 1)) == 0)
             )
             for i in range(num_layers)
         ]
@@ -537,7 +543,8 @@ class GPT(nn.Module):
         )
 
         for b in self.blocks:
-            b.attn.proj.weight = mx.zeros_like(b.attn.proj.weight)
+            if hasattr(b, 'attn'):
+                b.attn.proj.weight = mx.zeros_like(b.attn.proj.weight)
         self.shared_mlp.proj.weight = mx.zeros_like(self.shared_mlp.proj.weight)
         self.tok_emb.weight = (
             mx.random.normal(self.tok_emb.weight.shape, dtype=mx.float32)
