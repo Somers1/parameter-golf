@@ -28,20 +28,27 @@ from mlx.utils import tree_flatten, tree_unflatten
 
 
 DEFAULTS = {
+    "SKIP_VAL": "1",
     "ITERATIONS": "2000",
     "TRAIN_BATCH_TOKENS": "65536",
     "VAL_LOSS_EVERY": "0",
     "VAL_BATCH_SIZE": "524288",
     "TRAIN_LOG_EVERY": "10",
     "SKIP_QUANTIZE": "1",
-    "MLP_MULT": "16",
-    "MTP_HEADS": "3",
-    "SKIP_VAL": "1",
 }
+ID_DEFAULT = {
+    "MLP_MULT": "16",
+    "MODEL_DIM": "512",
+    "MTP_HEADS": "3",
+    "Q_LATENT": "128",
+    "KV_LATENT": "64",
+    "GATE_RANK": "32",
+}
+DEFAULTS.update(ID_DEFAULT)
 for k, v in DEFAULTS.items():
     os.environ.setdefault(k, v)
 
-os.environ.setdefault("RUN_ID", "shared_gated_mlp" + "_".join(f"{k.lower()}{os.environ[k]}" for k in ["MLP_MULT", "MTP_HEADS"]))
+os.environ.setdefault("RUN_ID", "shared_gated_mlp_" + "_".join(f"{k.lower()}{os.environ[k]}" for k in ID_DEFAULT.keys()))
 
 # ==============================================================================
 # SHARD FORMAT + COMPUTE DTYPE
@@ -98,6 +105,9 @@ class Hyperparameters:
     rope_base: float = float(os.environ.get("ROPE_BASE", 10000.0))
     qk_gain_init: float = float(os.environ.get("QK_GAIN_INIT", 1.5))
     mtp_heads: int = int(os.environ.get("MTP_HEADS", 3))
+    q_latent: int = int(os.environ.get("Q_LATENT", 128))
+    kv_latent: int = int(os.environ.get("KV_LATENT", 128))
+    gate_rank: int = int(os.environ.get("GATE_RANK", 32))
 
     # Optimizer. We keep the same per-group defaults as train_gpt.py.
     beta1: float = float(os.environ.get("BETA1", 0.9))
@@ -322,6 +332,8 @@ class CausalSelfAttention(nn.Module):
         num_kv_heads: int,
         rope_base: float,
         qk_gain_init: float,
+        q_latent: int,
+        kv_latent: int
     ):
         super().__init__()
         if dim % num_heads != 0:
@@ -334,9 +346,13 @@ class CausalSelfAttention(nn.Module):
         if self.head_dim % 2 != 0:
             raise ValueError("head_dim must be even for RoPE")
         kv_dim = self.num_kv_heads * self.head_dim
-        self.c_q = CastedLinear(dim, dim)
-        self.c_k = CastedLinear(dim, kv_dim)
-        self.c_v = CastedLinear(dim, kv_dim)
+
+        self.q_down = CastedLinear(dim, q_latent)
+        self.q_up   = CastedLinear(q_latent, dim)
+        self.kv_down = CastedLinear(dim, kv_latent)
+        self.k_up   = CastedLinear(kv_latent, kv_dim)
+        self.v_up   = CastedLinear(kv_latent, kv_dim)
+
         self.proj = CastedLinear(dim, dim)
         self.q_gain = mx.ones((num_heads,), dtype=mx.float32) * qk_gain_init
         self.rope = nn.RoPE(self.head_dim, traditional=False, base=rope_base)
@@ -344,9 +360,11 @@ class CausalSelfAttention(nn.Module):
 
     def __call__(self, x: mx.array) -> mx.array:
         bsz, seqlen, dim = x.shape
-        q = self.c_q(x).reshape(bsz, seqlen, self.num_heads, self.head_dim).transpose(0, 2, 1, 3)
-        k = self.c_k(x).reshape(bsz, seqlen, self.num_kv_heads, self.head_dim).transpose(0, 2, 1, 3)
-        v = self.c_v(x).reshape(bsz, seqlen, self.num_kv_heads, self.head_dim).transpose(0, 2, 1, 3)
+        kv_latent = self.kv_down(x)
+        v = self.v_up(kv_latent)
+        q = self.q_up(self.q_down(x)).reshape(bsz, seqlen, self.num_heads, self.head_dim).transpose(0, 2, 1, 3)
+        k = self.k_up(kv_latent).reshape(bsz, seqlen, self.num_kv_heads, self.head_dim).transpose(0, 2, 1, 3)
+        v = self.v_up(x).reshape(bsz, seqlen, self.num_kv_heads, self.head_dim).transpose(0, 2, 1, 3)
 
         q = self.rope(rms_norm(q).astype(COMPUTE_DTYPE))
         k = self.rope(rms_norm(k).astype(COMPUTE_DTYPE))
@@ -373,12 +391,14 @@ class Block(nn.Module):
         shared_mlp: SharedMLP,
         rope_base: float,
         qk_gain_init: float,
+        q_latent: int,
+        kv_latent: int,
         gate_rank: int = 32,
     ):
         super().__init__()
         self.attn_norm = RMSNormNoWeight()
         self.mlp_norm = RMSNormNoWeight()
-        self.attn = CausalSelfAttention(dim, num_heads, num_kv_heads, rope_base, qk_gain_init)
+        self.attn = CausalSelfAttention(dim, num_heads, num_kv_heads, rope_base, qk_gain_init, q_latent, kv_latent)
         self._shared_mlp = shared_mlp  # underscore: not owned, won't appear in tree_flatten
         self.attn_scale = mx.ones((dim,), dtype=mx.float32)
         self.mlp_scale = mx.ones((dim,), dtype=mx.float32)
@@ -410,7 +430,7 @@ class GPT(nn.Module):
     # - tied embeddings for the LM head (the baseline default setup)
     def __init__(self, vocab_size: int, num_layers: int, dim: int, num_heads: int, num_kv_heads: int, mlp_mult: int,
                  logit_chunk_tokens: int, logit_softcap: float, rope_base: float, tied_embed_init_std: float,
-                 qk_gain_init: float, mtp_heads: int = 0):
+                 qk_gain_init: float, q_latent: int, kv_latent: int, gate_rank: int, mtp_heads: int = 0):
         super().__init__()
         if logit_softcap <= 0.0:
             raise ValueError(f"logit_softcap must be positive, got {logit_softcap}")
@@ -424,7 +444,7 @@ class GPT(nn.Module):
         self.skip_weights = mx.ones((self.num_skip_weights, dim), dtype=mx.float32)
         self.shared_mlp = SharedMLP(dim, dim * mlp_mult)
         self.blocks = [
-            Block(dim, num_heads, num_kv_heads, self.shared_mlp, rope_base, qk_gain_init)
+            Block(dim, num_heads, num_kv_heads, self.shared_mlp, rope_base, qk_gain_init, q_latent, kv_latent, gate_rank)
             for i in range(num_layers)
         ]
         self.final_norm = RMSNormNoWeight()
@@ -954,6 +974,9 @@ def main() -> None:
         rope_base=args.rope_base,
         tied_embed_init_std=args.tied_embed_init_std,
         qk_gain_init=args.qk_gain_init,
+        q_latent=args.q_latent,
+        kv_latent=args.kv_latent,
+        gate_rank=args.gate_rank,
         mtp_heads=args.mtp_heads,
     )
     opt = SplitOptimizers(model, args)
@@ -1011,7 +1034,6 @@ def main() -> None:
     log(f"compute_dtype:{COMPUTE_DTYPE} compile:True")
     log(
         f"dtypes tok_emb:{model.tok_emb.weight.dtype} "
-        f"linear_weight:{model.blocks[0].attn.c_q.weight.dtype} "
         f"skip_weights:{model.skip_weights.dtype}"
     )
 
