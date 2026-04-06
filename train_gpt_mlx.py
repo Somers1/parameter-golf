@@ -27,13 +27,14 @@ import mlx.optimizers as optim
 from mlx.utils import tree_flatten, tree_unflatten
 
 
-os.environ.setdefault("RUN_ID", "shared_gated_mlp")
+os.environ.setdefault("RUN_ID", "gated_shared_mlp_v1")
 os.environ.setdefault("ITERATIONS", "2000")
 os.environ.setdefault("TRAIN_BATCH_TOKENS", "65536")
 os.environ.setdefault("VAL_LOSS_EVERY", "0")
 os.environ.setdefault("VAL_BATCH_SIZE", "524288")
-os.environ.setdefault("TRAIN_LOG_EVERY", "50")
+os.environ.setdefault("TRAIN_LOG_EVERY", "10")
 os.environ.setdefault("SKIP_QUANTIZE", "1")
+os.environ.setdefault("MLP_MULT", "16")
 
 # ==============================================================================
 # SHARD FORMAT + COMPUTE DTYPE
@@ -1122,11 +1123,4 @@ def main() -> None:
 
 if __name__ == "__main__":
     # Gated Shared MLP v1 — same config as baseline for fair comparison
-    os.environ.setdefault("RUN_ID", "gated_shared_mlp_v1")
-    os.environ.setdefault("ITERATIONS", "2000")
-    os.environ.setdefault("TRAIN_BATCH_TOKENS", "65536")
-    os.environ.setdefault("VAL_LOSS_EVERY", "0")
-    os.environ.setdefault("VAL_BATCH_SIZE", "524288")
-    os.environ.setdefault("TRAIN_LOG_EVERY", "10")
-    os.environ.setdefault("SKIP_QUANTIZE", "1")
     main()
