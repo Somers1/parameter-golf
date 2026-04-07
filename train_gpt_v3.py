@@ -723,18 +723,6 @@ class BigramHashEmbedding(nn.Module):
         if self.proj is not None:
             h = self.proj(h)
         return h * self.scale.to(dtype=h.dtype)
-    def forward_raw(self, token_ids: Tensor) -> Tensor:
-        """Return projected+scaled n-gram embeddings for gated injection."""
-        h = self.embed(self.bigram_hash(token_ids))
-        if self._num_heads >= 2:
-            h = h + self.embed(self.bigram_hash_head2(token_ids))
-        if self._trigram:
-            h = h + self.embed(self.trigram_hash(token_ids))
-        if self.proj is not None:
-            h = self.proj(h)
-        return h * self.scale.to(dtype=h.dtype)
-
-
 class EngramGate(nn.Module):
     """Lightweight scalar gate for n-gram injection at a specific layer.
     Hidden state produces a scalar gate via a small linear; n-gram embedding
@@ -964,11 +952,13 @@ class GPT(nn.Module):
     def forward(self, input_ids: Tensor, target_ids: Tensor) -> Tensor:
         n = self.num_layers
         x = self.tok_emb(input_ids)
-        # Always add bigram at input (original behaviour preserved)
+        # Compute bigram once, reuse for both input injection and engram layers
+        ngram_emb = None
         if self.bigram is not None:
-            x = x + self.bigram(input_ids)
-        # Pre-compute n-gram embeddings for additional gated injection at deeper layers
-        ngram_emb = self.bigram.forward_raw(input_ids) if (self.bigram is not None and self.engram_layer_indices) else None
+            ngram_emb = self.bigram(input_ids)
+            x = x + ngram_emb
+        if not self.engram_layer_indices:
+            ngram_emb = None
         x = F.rms_norm(x, (x.size(-1),))
         x = self.smear(x)
         x0 = x
@@ -1031,9 +1021,12 @@ class GPT(nn.Module):
         """Return logits (bsz, seq_len, vocab) without computing loss."""
         n = self.num_layers
         x = self.tok_emb(input_ids)
+        ngram_emb = None
         if self.bigram is not None:
-            x = x + self.bigram(input_ids)
-        ngram_emb = self.bigram.forward_raw(input_ids) if (self.bigram is not None and self.engram_layer_indices) else None
+            ngram_emb = self.bigram(input_ids)
+            x = x + ngram_emb
+        if not self.engram_layer_indices:
+            ngram_emb = None
         x = F.rms_norm(x, (x.size(-1),))
         x = self.smear(x)
         x0 = x
@@ -1508,9 +1501,12 @@ class _HessianGPT(nn.Module):
         return self.engram_gates[gate_idx](hidden, ngram_emb)
     def forward(self, input_ids, target_ids):
         x = self.tok_emb(input_ids)
+        ngram_emb = None
         if self.bigram is not None:
-            x = x + self.bigram(input_ids)
-        ngram_emb = self.bigram.forward_raw(input_ids) if (self.bigram is not None and self.engram_layer_indices) else None
+            ngram_emb = self.bigram(input_ids)
+            x = x + ngram_emb
+        if not self.engram_layer_indices:
+            ngram_emb = None
         x = F.rms_norm(x, (x.size(-1),))
         x = self.smear(x)
         x0 = x
