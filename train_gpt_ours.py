@@ -128,7 +128,7 @@ class Hyperparameters:
 
     # EMA for shared MLP weights (smooths gradient interference).
     ema_shared_beta = float(os.environ.get("EMA_SHARED_BETA", 0))  # 0 = disabled, try 0.995 or 0.998
-    ema_shared_start = int(os.environ.get("EMA_SHARED_START", 800))  # step to start EMA
+    ema_shared_start_frac = float(os.environ.get("EMA_SHARED_START_FRAC", 0.1))  # fraction of warmdown start
 
     # MLA (Multi-head Latent Attention).
     q_latent = int(os.environ.get("Q_LATENT", 128))
@@ -1196,8 +1196,9 @@ def main() -> None:
             opt.step()
         zero_grad_all()
 
-        # Update EMA of shared MLP weights
-        if ema_shared_state and step >= args.ema_shared_start:
+        # Update EMA of shared MLP weights (start after ema_shared_start_frac of elapsed wall time)
+        ema_active = ema_shared_state and (max_wallclock_ms is None or approx_training_time_ms >= max_wallclock_ms * args.ema_shared_start_frac)
+        if ema_active:
             beta = args.ema_shared_beta
             for name, p in base_model.named_parameters():
                 if name in ema_shared_state:
