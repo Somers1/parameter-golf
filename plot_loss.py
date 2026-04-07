@@ -14,13 +14,10 @@ DEFAULT_SSH = "7eccm2gamj7h7y-64411faa@ssh.runpod.io"
 DEFAULT_KEY = os.path.expanduser("~/.ssh/id_ed25519")
 REMOTE_LOGS = "/workspace/parameter-golf/logs/"
 
-# Add substrings here to exclude runs from the plot
+# Add log filenames here to exclude runs from the plot
 EXCLUDE = [
-    "w6144",
-    "w3072_g16",
-    "w3072_g32_p16",
-    "w3072_g32_p32",
-    "w3072_g64",
+    # "baseline.txt",
+    # "ours_mlp_width3072_mtp_heads0_q_latent0_kv_latent64_gate_rank16_adapt_rank0_private_mlp_rank32_num_layers11_attend_every1.txt",
 ]
 
 
@@ -198,10 +195,9 @@ def main():
 
     if args.filter:
         log_files = [f for f in log_files if args.filter in f.name]
-    all_excludes = EXCLUDE + (args.exclude or [])
+    all_excludes = set(EXCLUDE + (args.exclude or []))
     if all_excludes:
-        log_files = [f for f in log_files
-                     if not any(ex in f.name for ex in all_excludes)]
+        log_files = [f for f in log_files if f.name not in all_excludes]
 
     if not log_files:
         print("No log files found.")
