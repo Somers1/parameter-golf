@@ -735,7 +735,7 @@ class MLP(nn.Module):
         super().__init__()
         self.has_bottleneck = mlp_rank > 0
         if self.has_bottleneck:
-            hidden = mlp_mult * dim
+            hidden = int(mlp_mult * dim)
             self.fc_down = CastedLinear(dim, mlp_rank, bias=False)
             self.fc_up = CastedLinear(mlp_rank, hidden, bias=False)
             self.proj_down = CastedLinear(hidden, mlp_rank, bias=False)
