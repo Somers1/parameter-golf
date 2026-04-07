@@ -686,11 +686,20 @@ class CausalSelfAttention(nn.Module):
 class SharedMLP(nn.Module):
     def __init__(self, dim: int, total_width: int, num_banks: int = 0):
         super().__init__()
-        self.fc = CastedLinear(dim, total_width, bias=False)
-        self.proj = CastedLinear(total_width, dim, bias=False)
-        self.proj._zero_init = True
         self.num_banks = num_banks
-        self.bank_width = total_width // num_banks if num_banks > 0 else total_width
+        if num_banks > 0:
+            assert total_width % num_banks == 0, f"mlp_width ({total_width}) must be divisible by num_banks ({num_banks})"
+            self.bank_width = total_width // num_banks
+            # Separate modules per bank — clean dense ops, torch.compile friendly
+            self.bank_fc = nn.ModuleList([CastedLinear(dim, self.bank_width, bias=False) for _ in range(num_banks)])
+            self.bank_proj = nn.ModuleList([CastedLinear(self.bank_width, dim, bias=False) for _ in range(num_banks)])
+            for p in self.bank_proj:
+                p._zero_init = True
+        else:
+            self.bank_width = total_width
+            self.fc = CastedLinear(dim, total_width, bias=False)
+            self.proj = CastedLinear(total_width, dim, bias=False)
+            self.proj._zero_init = True
 
 
 class Block(nn.Module):
@@ -711,18 +720,20 @@ class Block(nn.Module):
         self.mlp_scale = nn.Parameter(torch.ones(dim, dtype=torch.float32))
         self.resid_mix = nn.Parameter(torch.stack((torch.ones(dim), torch.zeros(dim))).float())
 
-        # Bank routing: each layer uses a fixed subset of banks from the shared MLP
+        # Bank routing: each layer selects top-k banks with learned soft weights
         self.use_banks = num_banks > 0 and active_banks > 0
         if self.use_banks:
-            assert mlp_width % num_banks == 0, f"mlp_width ({mlp_width}) must be divisible by num_banks ({num_banks})"
-            assert 0 < active_banks <= num_banks, f"active_banks ({active_banks}) must be in [1, {num_banks}]"
+            assert 0 < active_banks <= num_banks
+            self.active_banks = active_banks
             self.bank_width = mlp_width // num_banks
-            # Fixed round-robin assignment: each layer gets a different set of banks
-            bank_ids = [(layer_idx + b) % num_banks for b in range(active_banks)]
-            bank_ids.sort()
-            col_ranges = [torch.arange(b * self.bank_width, (b + 1) * self.bank_width) for b in bank_ids]
-            self.register_buffer("bank_cols", torch.cat(col_ranges))
-            active_width = self.bank_width * active_banks
+            # Learned routing logits — diverse init so layers start preferring different banks
+            self.bank_logits = nn.Parameter(torch.zeros(num_banks, dtype=torch.float32))
+            with torch.no_grad():
+                # Each layer starts with high logits on its "home" banks
+                for b in range(num_banks):
+                    dist = min(abs(b - layer_idx % num_banks), num_banks - abs(b - layer_idx % num_banks))
+                    self.bank_logits.data[b] = 2.0 if dist < active_banks else -2.0
+            active_width = self.bank_width  # gate/adapt sized per-bank, applied to each bank
         else:
             active_width = mlp_width
 
@@ -767,19 +778,25 @@ class Block(nn.Module):
 
         normed = self.mlp_norm(x)
         if self.use_banks:
-            # Use only selected bank columns/rows — precomputed indices
-            fc_w = shared_mlp.fc.weight[self.bank_cols, :].to(normed.dtype)
-            h = F.linear(normed, fc_w)
-            if self.has_adapt:
-                h = h + self.adapt_up_B(self.adapt_up_A(normed))
-            h = torch.relu(h).square()
-            if self.has_gate:
-                gate = torch.tanh(self.gate_up(self.gate_down(normed)))
-                h = h * (1.0 + gate)
-            proj_w = shared_mlp.proj.weight[:, self.bank_cols].to(h.dtype)
-            mlp_out = F.linear(h, proj_w)
-            if self.has_adapt:
-                mlp_out = mlp_out + self.adapt_down_B(self.adapt_down_A(h))
+            # Select top-k banks, compute soft weights for gradient flow
+            _, top_idx = torch.topk(self.bank_logits, self.active_banks)
+            top_scores = torch.softmax(self.bank_logits[top_idx], dim=0)
+            # Compute each selected bank and weight its output
+            mlp_out = torch.zeros_like(x)
+            for i in range(self.active_banks):
+                bank_id = top_idx[i]
+                w = top_scores[i]
+                h = shared_mlp.bank_fc[bank_id](normed)
+                if self.has_adapt:
+                    h = h + self.adapt_up_B(self.adapt_up_A(normed))
+                h = torch.relu(h).square()
+                if self.has_gate:
+                    gate = torch.tanh(self.gate_up(self.gate_down(normed)))
+                    h = h * (1.0 + gate)
+                bank_out = shared_mlp.bank_proj[bank_id](h)
+                if self.has_adapt:
+                    bank_out = bank_out + self.adapt_down_B(self.adapt_down_A(h))
+                mlp_out = mlp_out + w * bank_out
         else:
             h = shared_mlp.fc(normed)
             if self.has_adapt:
