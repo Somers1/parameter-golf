@@ -26,8 +26,7 @@ DEFAULTS = {
     "TIED_EMBED_LR": "0.05",
 }
 ID_DEFAULT = {
-    "MLP_WINDOW": "1024",
-    "MLP_OVERLAP": "0.2",
+    "MLP_WIDTH": "2048",
     "MTP_HEADS": "0",
     "Q_LATENT": "128",
     "KV_LATENT": "64",
@@ -115,9 +114,8 @@ class Hyperparameters:
     rope_base = float(os.environ.get("ROPE_BASE", 10000.0))
     logit_softcap = float(os.environ.get("LOGIT_SOFTCAP", 30.0))
 
-    # Sliding window shared MLP.
-    mlp_window = int(os.environ.get("MLP_WINDOW", 2048))
-    mlp_overlap = float(os.environ.get("MLP_OVERLAP", 0.5))
+    # Shared MLP.
+    mlp_width = int(os.environ.get("MLP_WIDTH", 2048))
     gate_rank = int(os.environ.get("GATE_RANK", 32))
     adapt_rank = int(os.environ.get("ADAPT_RANK", 0))
     private_mlp_rank = int(os.environ.get("PRIVATE_MLP_RANK", 0))
@@ -692,7 +690,7 @@ class Block(nn.Module):
     def __init__(self, dim: int, num_heads: int, num_kv_heads: int, rope_base: float,
                  qk_gain_init: float, q_latent: int, kv_latent: int, gate_rank: int,
                  adapt_rank: int, private_mlp_rank: int,
-                 layer_idx: int, mlp_window: int, mlp_stride: int, has_attention: bool = True):
+                 layer_idx: int, mlp_width: int, has_attention: bool = True):
         super().__init__()
         self.has_attention = has_attention
         if has_attention:
@@ -702,8 +700,6 @@ class Block(nn.Module):
             self.attn_scale = nn.Parameter(torch.ones(dim, dtype=torch.float32))
 
         self.mlp_norm = RMSNorm()
-        self.mlp_start = layer_idx * mlp_stride
-        self.mlp_end = self.mlp_start + mlp_window
         self.mlp_scale = nn.Parameter(torch.ones(dim, dtype=torch.float32))
         self.resid_mix = nn.Parameter(torch.stack((torch.ones(dim), torch.zeros(dim))).float())
 
@@ -711,11 +707,11 @@ class Block(nn.Module):
         self.has_gate = gate_rank > 0
         if self.has_gate:
             self.gate_down = CastedLinear(dim, gate_rank, bias=False)
-            self.gate_up = CastedLinear(gate_rank, mlp_window, bias=False)
-            # Diverse init: each layer emphasizes a different region of the window
+            self.gate_up = CastedLinear(gate_rank, mlp_width, bias=False)
+            # Diverse init: each layer emphasizes a different region of the MLP
             with torch.no_grad():
                 nn.init.zeros_(self.gate_up.weight)
-                t = torch.linspace(0, 2 * math.pi, mlp_window)
+                t = torch.linspace(0, 2 * math.pi, mlp_width)
                 for r in range(min(gate_rank, self.gate_up.weight.shape[1])):
                     freq = (layer_idx + 1) + r * 0.5
                     pattern = 0.05 * torch.sin(freq * t)
@@ -725,9 +721,9 @@ class Block(nn.Module):
         self.has_adapt = adapt_rank > 0
         if self.has_adapt:
             self.adapt_up_A = CastedLinear(dim, adapt_rank, bias=False)
-            self.adapt_up_B = CastedLinear(adapt_rank, mlp_window, bias=False)
+            self.adapt_up_B = CastedLinear(adapt_rank, mlp_width, bias=False)
             self.adapt_up_B._zero_init = True
-            self.adapt_down_A = CastedLinear(mlp_window, adapt_rank, bias=False)
+            self.adapt_down_A = CastedLinear(mlp_width, adapt_rank, bias=False)
             self.adapt_down_B = CastedLinear(adapt_rank, dim, bias=False)
             self.adapt_down_B._zero_init = True
 
@@ -747,16 +743,14 @@ class Block(nn.Module):
             x = x + self.attn_scale.to(dtype=x.dtype)[None, None, :] * attn_out
 
         normed = self.mlp_norm(x)
-        fc_w = shared_mlp.fc.weight[self.mlp_start:self.mlp_end, :].to(normed.dtype)
-        h = F.linear(normed, fc_w)
+        h = shared_mlp.fc(normed)
         if self.has_adapt:
             h = h + self.adapt_up_B(self.adapt_up_A(normed))
         h = torch.relu(h).square()
         if self.has_gate:
             gate = torch.tanh(self.gate_up(self.gate_down(normed)))
             h = h * (1.0 + gate)
-        proj_w = shared_mlp.proj.weight[:, self.mlp_start:self.mlp_end].to(h.dtype)
-        mlp_out = F.linear(h, proj_w)
+        mlp_out = shared_mlp.proj(h)
         if self.has_adapt:
             mlp_out = mlp_out + self.adapt_down_B(self.adapt_down_A(h))
         if self.has_private_mlp:
@@ -770,7 +764,7 @@ class GPT(nn.Module):
     def __init__(self, vocab_size: int, num_layers: int, model_dim: int, num_heads: int,
                  num_kv_heads: int, mlp_mult: int, tie_embeddings: bool, tied_embed_init_std: float,
                  logit_softcap: float, rope_base: float, qk_gain_init: float,
-                 mlp_window: int, mlp_overlap: float, gate_rank: int, adapt_rank: int,
+                 mlp_width: int, gate_rank: int, adapt_rank: int,
                  private_mlp_rank: int,
                  attend_every: int, q_latent: int, kv_latent: int, mtp_heads: int):
         super().__init__()
@@ -786,15 +780,13 @@ class GPT(nn.Module):
         self.num_skip_weights = min(self.num_encoder_layers, self.num_decoder_layers)
         self.skip_weights = nn.Parameter(torch.ones(self.num_skip_weights, model_dim, dtype=torch.float32))
 
-        # Sliding window shared MLP
-        mlp_stride = int(mlp_window * (1.0 - mlp_overlap))
-        total_width = mlp_window + mlp_stride * (num_layers - 1)
-        self.shared_mlp = SharedMLP(model_dim, total_width)
+        # Shared MLP — every layer sees the full width, gates handle routing
+        self.shared_mlp = SharedMLP(model_dim, mlp_width)
 
         self.blocks = nn.ModuleList([
             Block(model_dim, num_heads, num_kv_heads, rope_base, qk_gain_init,
                   q_latent, kv_latent, gate_rank, adapt_rank, private_mlp_rank,
-                  layer_idx=i, mlp_window=mlp_window, mlp_stride=mlp_stride,
+                  layer_idx=i, mlp_width=mlp_width,
                   has_attention=(i % attend_every == 0))
             for i in range(num_layers)
         ])
@@ -972,8 +964,7 @@ def main() -> None:
         logit_softcap=args.logit_softcap,
         rope_base=args.rope_base,
         qk_gain_init=args.qk_gain_init,
-        mlp_window=args.mlp_window,
-        mlp_overlap=args.mlp_overlap,
+        mlp_width=args.mlp_width,
         gate_rank=args.gate_rank,
         adapt_rank=args.adapt_rank,
         private_mlp_rank=args.private_mlp_rank,
