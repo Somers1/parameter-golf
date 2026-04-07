@@ -724,7 +724,7 @@ class BigramHashEmbedding(nn.Module):
             h = self.proj(h)
         return h * self.scale.to(dtype=h.dtype)
     def forward_raw(self, token_ids: Tensor) -> Tensor:
-        """Return projected n-gram embeddings WITHOUT scaling, for gated injection."""
+        """Return projected+scaled n-gram embeddings for gated injection."""
         h = self.embed(self.bigram_hash(token_ids))
         if self._num_heads >= 2:
             h = h + self.embed(self.bigram_hash_head2(token_ids))
@@ -732,28 +732,21 @@ class BigramHashEmbedding(nn.Module):
             h = h + self.embed(self.trigram_hash(token_ids))
         if self.proj is not None:
             h = self.proj(h)
-        return h
+        return h * self.scale.to(dtype=h.dtype)
 
 
 class EngramGate(nn.Module):
-    """Scalar context-aware gate for n-gram injection at a specific layer.
-    Dot-product gate between hidden state and n-gram embedding, with
-    sign-preserving sqrt normalization (from DeepSeek Engram)."""
+    """Lightweight scalar gate for n-gram injection at a specific layer.
+    Hidden state produces a scalar gate via a small linear; n-gram embedding
+    is injected directly (no value_proj) scaled by the gate."""
     def __init__(self, model_dim: int):
         super().__init__()
-        self.key_proj = CastedLinear(model_dim, model_dim, bias=False)
-        self.key_norm = RMSNorm()
-        self.query_norm = RMSNorm()
-        self.value_proj = CastedLinear(model_dim, model_dim, bias=False)
-        nn.init.zeros_(self.value_proj.weight)
-        self._dim = model_dim
+        self.gate_proj = nn.Linear(model_dim, 1, bias=True)
+        nn.init.zeros_(self.gate_proj.weight)
+        nn.init.constant_(self.gate_proj.bias, -2.0)  # sigmoid(-2) ≈ 0.12, starts mostly closed
     def forward(self, hidden: Tensor, ngram_emb: Tensor) -> Tensor:
-        key = self.key_norm(self.key_proj(ngram_emb))
-        query = self.query_norm(hidden)
-        gate = (key * query).sum(dim=-1, keepdim=True) / math.sqrt(self._dim)
-        gate = gate.abs().clamp_min(1e-6).sqrt() * gate.sign()
-        gate = gate.sigmoid()
-        return gate * self.value_proj(ngram_emb)
+        gate = torch.sigmoid(self.gate_proj(hidden))  # (bsz, seq, 1)
+        return gate * ngram_emb
 
 class ValueEmbedding(nn.Module):
     """Reinject token identity into attention values at specific layers.
@@ -971,10 +964,10 @@ class GPT(nn.Module):
     def forward(self, input_ids: Tensor, target_ids: Tensor) -> Tensor:
         n = self.num_layers
         x = self.tok_emb(input_ids)
-        # Bigram: input-only if no engram layers, otherwise deferred to gated layer injection
-        if self.bigram is not None and not self.engram_layer_indices:
+        # Always add bigram at input (original behaviour preserved)
+        if self.bigram is not None:
             x = x + self.bigram(input_ids)
-        # Pre-compute raw n-gram embeddings for gated injection
+        # Pre-compute n-gram embeddings for additional gated injection at deeper layers
         ngram_emb = self.bigram.forward_raw(input_ids) if (self.bigram is not None and self.engram_layer_indices) else None
         x = F.rms_norm(x, (x.size(-1),))
         x = self.smear(x)
@@ -1038,7 +1031,7 @@ class GPT(nn.Module):
         """Return logits (bsz, seq_len, vocab) without computing loss."""
         n = self.num_layers
         x = self.tok_emb(input_ids)
-        if self.bigram is not None and not self.engram_layer_indices:
+        if self.bigram is not None:
             x = x + self.bigram(input_ids)
         ngram_emb = self.bigram.forward_raw(input_ids) if (self.bigram is not None and self.engram_layer_indices) else None
         x = F.rms_norm(x, (x.size(-1),))
@@ -1515,7 +1508,7 @@ class _HessianGPT(nn.Module):
         return self.engram_gates[gate_idx](hidden, ngram_emb)
     def forward(self, input_ids, target_ids):
         x = self.tok_emb(input_ids)
-        if self.bigram is not None and not self.engram_layer_indices:
+        if self.bigram is not None:
             x = x + self.bigram(input_ids)
         ngram_emb = self.bigram.forward_raw(input_ids) if (self.bigram is not None and self.engram_layer_indices) else None
         x = F.rms_norm(x, (x.size(-1),))
@@ -1774,12 +1767,10 @@ def main() -> None:
     scalar_params.append(base_model.smear.gate)
     if base_model.bigram is not None:
         scalar_params.append(base_model.bigram.scale)
-    # Engram gate projections -> Adam with matrix_lr (512x512 matrices, too large for scalar_lr)
-    engram_matrix_params = []
+    # Engram gates are tiny (512→1 linear), add all params to scalar_params
     for engram_gate in base_model.engram_gates:
         for p in engram_gate.parameters():
-            if p.ndim >= 2:
-                engram_matrix_params.append(p)
+            scalar_params.append(p)
     token_lr = args.tied_embed_lr if args.tie_embeddings else args.embed_lr
     tok_params = [{"params": [base_model.tok_emb.weight], "lr": token_lr, "base_lr": token_lr}]
     if base_model.bigram is not None:
@@ -1816,21 +1807,11 @@ def main() -> None:
         weight_decay=args.adam_wd,
         fused=True,
     )
-    optimizer_engram = None
-    if engram_matrix_params:
-        optimizer_engram = torch.optim.AdamW(
-            [{"params": engram_matrix_params, "lr": args.matrix_lr, "base_lr": args.matrix_lr}],
-            betas=(args.beta1, args.beta2),
-            eps=args.adam_eps,
-            weight_decay=args.adam_wd,
-            fused=True,
-        )
     # Non-bank params that need manual all-reduce (replicated across GPUs)
     replicated_params = list(optimizer_tok.param_groups[0]["params"])
     for pg in optimizer_tok.param_groups[1:]:
         replicated_params.extend(pg["params"])
     replicated_params.extend(scalar_params)
-    replicated_params.extend(engram_matrix_params)
 
     optimizer_head = None
     if base_model.lm_head is not None:
@@ -1842,8 +1823,6 @@ def main() -> None:
         )
         replicated_params.append(base_model.lm_head.weight)
     optimizers: list[torch.optim.Optimizer] = [optimizer_tok, optimizer_muon, optimizer_scalar]
-    if optimizer_engram is not None:
-        optimizers.append(optimizer_engram)
     if optimizer_head is not None:
         optimizers.append(optimizer_head)
     n_params = sum(p.numel() for p in base_model.parameters())
