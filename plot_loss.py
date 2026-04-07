@@ -16,8 +16,11 @@ REMOTE_LOGS = "/workspace/parameter-golf/logs/"
 
 # Add substrings here to exclude runs from the plot
 EXCLUDE = [
-    # "w6144",
-    # "w3072_g16",
+    "w6144",
+    "w3072_g16",
+    "w3072_g32_p16",
+    "w3072_g32_p32",
+    "w3072_g64",
 ]
 
 
