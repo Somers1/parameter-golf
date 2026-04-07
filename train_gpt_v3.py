@@ -82,6 +82,7 @@ class Hyperparameters:
     bigram_dim = int(os.environ.get("BIGRAM_DIM", 128))
     trigram_enabled = bool(int(os.environ.get("TRIGRAM", "0")))  # TrigramHash (off by default, risky)
     engram_layers = os.environ.get("ENGRAM_LAYERS", "")  # e.g. "1,6" — inject gated bigram at these layers (empty = input-only, original behaviour)
+    bigram_heads = int(os.environ.get("BIGRAM_HEADS", 1))  # 1 = single hash head (original), 2 = dual heads for fewer collisions
     xsa_last_n = int(os.environ.get("XSA_LAST_N", 11))  # XSA on ALL layers (our novel contribution)
     rope_dims = int(os.environ.get("ROPE_DIMS", 16))
     ln_scale = bool(int(os.environ.get("LN_SCALE", "1")))
@@ -679,10 +680,11 @@ class SmearGate(nn.Module):
         return (1 - g) * x + g * x_prev
 
 class BigramHashEmbedding(nn.Module):
-    def __init__(self, bigram_vocab_size: int, bigram_dim: int, model_dim: int, trigram: bool = False):
+    def __init__(self, bigram_vocab_size: int, bigram_dim: int, model_dim: int, trigram: bool = False, num_heads: int = 1):
         super().__init__()
         self.bigram_vocab_size = bigram_vocab_size
         self._trigram = trigram
+        self._num_heads = num_heads
         self.embed = nn.Embedding(bigram_vocab_size, bigram_dim)
         nn.init.zeros_(self.embed.weight)
         self.proj = CastedLinear(bigram_dim, model_dim, bias=False) if bigram_dim != model_dim else None
@@ -714,6 +716,8 @@ class BigramHashEmbedding(nn.Module):
         return out.long()
     def forward(self, token_ids: Tensor) -> Tensor:
         h = self.embed(self.bigram_hash(token_ids))
+        if self._num_heads >= 2:
+            h = h + self.embed(self.bigram_hash_head2(token_ids))
         if self._trigram:
             h = h + self.embed(self.trigram_hash(token_ids))
         if self.proj is not None:
@@ -721,7 +725,9 @@ class BigramHashEmbedding(nn.Module):
         return h * self.scale.to(dtype=h.dtype)
     def forward_raw(self, token_ids: Tensor) -> Tensor:
         """Return projected n-gram embeddings WITHOUT scaling, for gated injection."""
-        h = self.embed(self.bigram_hash(token_ids)) + self.embed(self.bigram_hash_head2(token_ids))
+        h = self.embed(self.bigram_hash(token_ids))
+        if self._num_heads >= 2:
+            h = h + self.embed(self.bigram_hash_head2(token_ids))
         if self._trigram:
             h = h + self.embed(self.trigram_hash(token_ids))
         if self.proj is not None:
@@ -834,6 +840,7 @@ class GPT(nn.Module):
         mtp_loss_weight: float = 0.1,
         bigram_vocab_size: int = 0,
         bigram_dim: int = 128,
+        bigram_heads: int = 1,
         xsa_last_n: int = 0,
         rope_dims: int = 0,
         ln_scale: bool = False,
@@ -856,7 +863,7 @@ class GPT(nn.Module):
         self.mtp_num_heads = mtp_num_heads
         self.mtp_loss_weight = mtp_loss_weight
         self.tok_emb = nn.Embedding(vocab_size, model_dim)
-        self.bigram = BigramHashEmbedding(bigram_vocab_size, bigram_dim, model_dim, trigram=bool(int(os.environ.get("TRIGRAM", "0")))) if bigram_vocab_size > 0 else None
+        self.bigram = BigramHashEmbedding(bigram_vocab_size, bigram_dim, model_dim, trigram=bool(int(os.environ.get("TRIGRAM", "0"))), num_heads=bigram_heads) if bigram_vocab_size > 0 else None
         # Engram: gated n-gram injection at specific layers (empty = input-only original behaviour)
         self.engram_layer_indices = [int(x) for x in engram_layers.split(",") if x.strip()] if engram_layers else []
         self.engram_gates = nn.ModuleList(
@@ -1452,7 +1459,7 @@ class _HessianGPT(nn.Module):
     """Non-banked GPT model matching unbanked state dict keys for Hessian collection."""
     def __init__(self, vocab_size, num_layers, model_dim, num_heads, num_kv_heads,
                  mlp_mult, tie_embeddings, logit_softcap, rope_base, qk_gain_init,
-                 bigram_vocab_size=0, bigram_dim=128, xsa_last_n=0,
+                 bigram_vocab_size=0, bigram_dim=128, bigram_heads=1, xsa_last_n=0,
                  rope_dims=0, ln_scale=False,
                  ve_enabled=False, ve_dim=128, ve_layers="9,10",
                  engram_layers=""):
@@ -1461,7 +1468,7 @@ class _HessianGPT(nn.Module):
         self.logit_softcap = logit_softcap
         self.num_layers = num_layers
         self.tok_emb = nn.Embedding(vocab_size, model_dim)
-        self.bigram = BigramHashEmbedding(bigram_vocab_size, bigram_dim, model_dim, trigram=bool(int(os.environ.get("TRIGRAM", "0")))) if bigram_vocab_size > 0 else None
+        self.bigram = BigramHashEmbedding(bigram_vocab_size, bigram_dim, model_dim, trigram=bool(int(os.environ.get("TRIGRAM", "0"))), num_heads=bigram_heads) if bigram_vocab_size > 0 else None
         self.engram_layer_indices = [int(x) for x in engram_layers.split(",") if x.strip()] if engram_layers else []
         self.engram_gates = nn.ModuleList(
             [EngramGate(model_dim) for _ in self.engram_layer_indices]
@@ -1721,6 +1728,7 @@ def main() -> None:
         mtp_loss_weight=args.mtp_loss_weight,
         bigram_vocab_size=args.bigram_vocab_size,
         bigram_dim=args.bigram_dim,
+        bigram_heads=args.bigram_heads,
         xsa_last_n=args.xsa_last_n,
         rope_dims=args.rope_dims,
         ln_scale=args.ln_scale,
@@ -1766,11 +1774,12 @@ def main() -> None:
     scalar_params.append(base_model.smear.gate)
     if base_model.bigram is not None:
         scalar_params.append(base_model.bigram.scale)
-    # Engram gate projections -> Adam (small matrices, not worth banking)
+    # Engram gate projections -> Adam with matrix_lr (512x512 matrices, too large for scalar_lr)
+    engram_matrix_params = []
     for engram_gate in base_model.engram_gates:
         for p in engram_gate.parameters():
             if p.ndim >= 2:
-                scalar_params.append(p)
+                engram_matrix_params.append(p)
     token_lr = args.tied_embed_lr if args.tie_embeddings else args.embed_lr
     tok_params = [{"params": [base_model.tok_emb.weight], "lr": token_lr, "base_lr": token_lr}]
     if base_model.bigram is not None:
@@ -1807,11 +1816,21 @@ def main() -> None:
         weight_decay=args.adam_wd,
         fused=True,
     )
+    optimizer_engram = None
+    if engram_matrix_params:
+        optimizer_engram = torch.optim.AdamW(
+            [{"params": engram_matrix_params, "lr": args.matrix_lr, "base_lr": args.matrix_lr}],
+            betas=(args.beta1, args.beta2),
+            eps=args.adam_eps,
+            weight_decay=args.adam_wd,
+            fused=True,
+        )
     # Non-bank params that need manual all-reduce (replicated across GPUs)
     replicated_params = list(optimizer_tok.param_groups[0]["params"])
     for pg in optimizer_tok.param_groups[1:]:
         replicated_params.extend(pg["params"])
     replicated_params.extend(scalar_params)
+    replicated_params.extend(engram_matrix_params)
 
     optimizer_head = None
     if base_model.lm_head is not None:
@@ -1823,6 +1842,8 @@ def main() -> None:
         )
         replicated_params.append(base_model.lm_head.weight)
     optimizers: list[torch.optim.Optimizer] = [optimizer_tok, optimizer_muon, optimizer_scalar]
+    if optimizer_engram is not None:
+        optimizers.append(optimizer_engram)
     if optimizer_head is not None:
         optimizers.append(optimizer_head)
     n_params = sum(p.numel() for p in base_model.parameters())
@@ -2052,7 +2073,7 @@ def main() -> None:
         num_heads=args.num_heads, num_kv_heads=args.num_kv_heads, mlp_mult=args.mlp_mult,
         tie_embeddings=args.tie_embeddings, logit_softcap=args.logit_softcap,
         rope_base=args.rope_base, qk_gain_init=args.qk_gain_init,
-        bigram_vocab_size=args.bigram_vocab_size, bigram_dim=args.bigram_dim,
+        bigram_vocab_size=args.bigram_vocab_size, bigram_dim=args.bigram_dim, bigram_heads=args.bigram_heads,
         xsa_last_n=args.xsa_last_n, rope_dims=args.rope_dims, ln_scale=args.ln_scale,
         ve_enabled=args.ve_enabled, ve_dim=args.ve_dim, ve_layers=args.ve_layers,
         engram_layers=args.engram_layers,
@@ -2157,7 +2178,7 @@ def main() -> None:
         tie_embeddings=args.tie_embeddings, tied_embed_init_std=args.tied_embed_init_std,
         logit_softcap=args.logit_softcap, rope_base=args.rope_base, qk_gain_init=args.qk_gain_init,
         mtp_num_heads=0, mtp_loss_weight=0.0,
-        bigram_vocab_size=args.bigram_vocab_size, bigram_dim=args.bigram_dim,
+        bigram_vocab_size=args.bigram_vocab_size, bigram_dim=args.bigram_dim, bigram_heads=args.bigram_heads,
         xsa_last_n=args.xsa_last_n,
         rope_dims=args.rope_dims, ln_scale=args.ln_scale, dtg=args.dtg_enabled,
         ve_enabled=args.ve_enabled, ve_dim=args.ve_dim, ve_layers=args.ve_layers,
