@@ -17,13 +17,22 @@ REMOTE_LOGS = "/workspace/parameter-golf/logs/"
 
 def sync_logs(ssh_host: str, ssh_key: str) -> None:
     LOCAL_LOGS.mkdir(exist_ok=True)
-    cmd = [
-        "rsync", "-avz", "--update",
-        "-e", f"ssh -i {ssh_key} -o StrictHostKeyChecking=no",
-        f"{ssh_host}:{REMOTE_LOGS}", str(LOCAL_LOGS) + "/",
-    ]
+    ssh_opts = f"-i {ssh_key} -o StrictHostKeyChecking=no"
+    # List remote log files first
+    ls_cmd = ["ssh"] + ssh_opts.split() + [ssh_host, f"ls {REMOTE_LOGS}*.txt 2>/dev/null"]
     print(f"Syncing logs from {ssh_host}...")
-    subprocess.run(cmd, check=True)
+    result = subprocess.run(ls_cmd, capture_output=True, text=True)
+    if result.returncode != 0 or not result.stdout.strip():
+        print("No remote log files found.")
+        return
+    remote_files = result.stdout.strip().split("\n")
+    # scp each file (runpod SSH doesn't support rsync)
+    for rf in remote_files:
+        fname = Path(rf).name
+        local_path = LOCAL_LOGS / fname
+        cmd = ["scp"] + ssh_opts.split() + [f"{ssh_host}:{rf}", str(local_path)]
+        subprocess.run(cmd, check=True, capture_output=True)
+        print(f"  {fname}")
     print("Sync complete.\n")
 
 
