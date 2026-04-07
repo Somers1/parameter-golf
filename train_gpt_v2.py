@@ -70,8 +70,9 @@ class Hyperparameters:
     rope_base = float(os.environ.get("ROPE_BASE", 10000.0))
     logit_softcap = float(os.environ.get("LOGIT_SOFTCAP", 30.0))
 
-    # MLA (Multi-head Latent Attention).
-    kv_latent = int(os.environ.get("KV_LATENT", 0))  # 0 = full KV projections
+    # Compressed MLP + LoRA adapter.
+    mlp_rank = int(os.environ.get("MLP_RANK", 0))  # 0 = standard dense MLP
+    adapt_rank = int(os.environ.get("ADAPT_RANK", 0))  # 0 = no adapter
 
     # Optimizer hyperparameters.
     embed_lr = float(os.environ.get("EMBED_LR", 0.6))
@@ -563,7 +564,6 @@ class CausalSelfAttention(nn.Module):
         num_kv_heads: int,
         rope_base: float,
         qk_gain_init: float,
-        kv_latent: int = 0,
     ):
         super().__init__()
         if dim % num_heads != 0:
@@ -577,14 +577,8 @@ class CausalSelfAttention(nn.Module):
             raise ValueError("head_dim must be even for RoPE")
         kv_dim = self.num_kv_heads * self.head_dim
         self.c_q = CastedLinear(dim, dim, bias=False)
-        self.has_kv_latent = kv_latent > 0
-        if self.has_kv_latent:
-            self.kv_down = CastedLinear(dim, kv_latent, bias=False)
-            self.k_up = CastedLinear(kv_latent, kv_dim, bias=False)
-            self.v_up = CastedLinear(kv_latent, kv_dim, bias=False)
-        else:
-            self.c_k = CastedLinear(dim, kv_dim, bias=False)
-            self.c_v = CastedLinear(dim, kv_dim, bias=False)
+        self.c_k = CastedLinear(dim, kv_dim, bias=False)
+        self.c_v = CastedLinear(dim, kv_dim, bias=False)
         self.proj = CastedLinear(dim, dim, bias=False)
         self.proj._zero_init = True
         self.q_gain = nn.Parameter(torch.full((num_heads,), qk_gain_init, dtype=torch.float32))
@@ -593,13 +587,8 @@ class CausalSelfAttention(nn.Module):
     def forward(self, x: Tensor) -> Tensor:
         bsz, seqlen, dim = x.shape
         q = self.c_q(x).reshape(bsz, seqlen, self.num_heads, self.head_dim).transpose(1, 2)
-        if self.has_kv_latent:
-            kv = self.kv_down(x)
-            k = self.k_up(kv).reshape(bsz, seqlen, self.num_kv_heads, self.head_dim).transpose(1, 2)
-            v = self.v_up(kv).reshape(bsz, seqlen, self.num_kv_heads, self.head_dim).transpose(1, 2)
-        else:
-            k = self.c_k(x).reshape(bsz, seqlen, self.num_kv_heads, self.head_dim).transpose(1, 2)
-            v = self.c_v(x).reshape(bsz, seqlen, self.num_kv_heads, self.head_dim).transpose(1, 2)
+        k = self.c_k(x).reshape(bsz, seqlen, self.num_kv_heads, self.head_dim).transpose(1, 2)
+        v = self.c_v(x).reshape(bsz, seqlen, self.num_kv_heads, self.head_dim).transpose(1, 2)
         q = F.rms_norm(q, (q.size(-1),))
         k = F.rms_norm(k, (k.size(-1),))
         cos, sin = self.rotary(seqlen, x.device, q.dtype)
@@ -619,17 +608,38 @@ class CausalSelfAttention(nn.Module):
 
 
 class MLP(nn.Module):
-    # relu^2 MLP from the original modded-nanogpt setup
-    def __init__(self, dim: int, mlp_mult: int):
+    def __init__(self, dim: int, mlp_mult: int, mlp_rank: int = 0, adapt_rank: int = 0):
         super().__init__()
         hidden = mlp_mult * dim
-        self.fc = CastedLinear(dim, hidden, bias=False)
-        self.proj = CastedLinear(hidden, dim, bias=False)
-        self.proj._zero_init = True
+        self.has_bottleneck = mlp_rank > 0
+        if self.has_bottleneck:
+            # Compressed: dim -> mlp_rank -> hidden -> mlp_rank -> dim
+            self.fc_down = CastedLinear(dim, mlp_rank, bias=False)
+            self.fc_up = CastedLinear(mlp_rank, hidden, bias=False)
+            self.proj_down = CastedLinear(hidden, mlp_rank, bias=False)
+            self.proj_up = CastedLinear(mlp_rank, dim, bias=False)
+            self.proj_up._zero_init = True
+        else:
+            self.fc = CastedLinear(dim, hidden, bias=False)
+            self.proj = CastedLinear(hidden, dim, bias=False)
+            self.proj._zero_init = True
+
+        self.has_adapt = adapt_rank > 0
+        if self.has_adapt:
+            self.adapt_A = CastedLinear(dim, adapt_rank, bias=False)
+            self.adapt_B = CastedLinear(adapt_rank, dim, bias=False)
+            self.adapt_B._zero_init = True
 
     def forward(self, x: Tensor) -> Tensor:
-        x = torch.relu(self.fc(x))
-        return self.proj(x.square())
+        if self.has_bottleneck:
+            h = torch.relu(self.fc_up(self.fc_down(x))).square()
+            out = self.proj_up(self.proj_down(h))
+        else:
+            h = torch.relu(self.fc(x)).square()
+            out = self.proj(h)
+        if self.has_adapt:
+            out = out + self.adapt_B(self.adapt_A(x))
+        return out
 
 
 class Block(nn.Module):
@@ -641,13 +651,14 @@ class Block(nn.Module):
         mlp_mult: int,
         rope_base: float,
         qk_gain_init: float,
-        kv_latent: int = 0,
+        mlp_rank: int = 0,
+        adapt_rank: int = 0,
     ):
         super().__init__()
         self.attn_norm = RMSNorm()
         self.mlp_norm = RMSNorm()
-        self.attn = CausalSelfAttention(dim, num_heads, num_kv_heads, rope_base, qk_gain_init, kv_latent=kv_latent)
-        self.mlp = MLP(dim, mlp_mult)
+        self.attn = CausalSelfAttention(dim, num_heads, num_kv_heads, rope_base, qk_gain_init)
+        self.mlp = MLP(dim, mlp_mult, mlp_rank=mlp_rank, adapt_rank=adapt_rank)
         self.attn_scale = nn.Parameter(torch.ones(dim, dtype=torch.float32))
         self.mlp_scale = nn.Parameter(torch.ones(dim, dtype=torch.float32))
         self.resid_mix = nn.Parameter(torch.stack((torch.ones(dim), torch.zeros(dim))).float())
@@ -675,7 +686,8 @@ class GPT(nn.Module):
         logit_softcap: float,
         rope_base: float,
         qk_gain_init: float,
-        kv_latent: int = 0,
+        mlp_rank: int = 0,
+        adapt_rank: int = 0,
     ):
         super().__init__()
         if logit_softcap <= 0.0:
@@ -697,7 +709,8 @@ class GPT(nn.Module):
                     mlp_mult,
                     rope_base,
                     qk_gain_init,
-                    kv_latent=kv_latent,
+                    mlp_rank=mlp_rank,
+                    adapt_rank=adapt_rank,
                 )
                 for i in range(num_layers)
             ]
@@ -853,7 +866,8 @@ def main() -> None:
         logit_softcap=args.logit_softcap,
         rope_base=args.rope_base,
         qk_gain_init=args.qk_gain_init,
-        kv_latent=args.kv_latent,
+        mlp_rank=args.mlp_rank,
+        adapt_rank=args.adapt_rank,
     ).to(device).bfloat16()
     for module in base_model.modules():
         if isinstance(module, CastedLinear):
