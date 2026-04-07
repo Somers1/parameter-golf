@@ -24,6 +24,9 @@ DEFAULTS = {
     "MATRIX_LR": "0.04",
     "SCALAR_LR": "0.04",
     "TIED_EMBED_LR": "0.05",
+    "SHARED_MATRIX_LR": "0.03",
+    "MODULATION_LR": "0.07",
+    "SHARED_MOMENTUM_MAX": "0.90",
 }
 ID_DEFAULT = {
     "MLP_WIDTH": "2048",
@@ -135,6 +138,9 @@ class Hyperparameters:
     tied_embed_init_std = float(os.environ.get("TIED_EMBED_INIT_STD", 0.005))
     matrix_lr = float(os.environ.get("MATRIX_LR", 0.04))
     scalar_lr = float(os.environ.get("SCALAR_LR", 0.04))
+    shared_matrix_lr = float(os.environ.get("SHARED_MATRIX_LR", 0.03))
+    modulation_lr = float(os.environ.get("MODULATION_LR", 0.07))
+    shared_momentum_max = float(os.environ.get("SHARED_MOMENTUM_MAX", 0.90))
     muon_momentum = float(os.environ.get("MUON_MOMENTUM", 0.95))
     muon_backend_steps = int(os.environ.get("MUON_BACKEND_STEPS", 5))
     muon_momentum_warmup_start = float(os.environ.get("MUON_MOMENTUM_WARMUP_START", 0.85))
@@ -983,18 +989,34 @@ def main() -> None:
     # Optimizer split:
     # - token embedding (Adam) uses EMBED_LR
     # - untied lm_head (Adam) uses HEAD_LR
-    # - matrix params in blocks + shared_mlp use MATRIX_LR via Muon
+    # - shared_mlp 2D matrices use SHARED_MATRIX_LR via Muon (conservative)
+    # - block 2D matrices (non-modulation) use MATRIX_LR via Muon
+    # - modulation params (gate_, adapt_, private_) use MODULATION_LR via Adam
+    # - remaining scalars/vectors use SCALAR_LR via Adam
     # - MTP heads use SCALAR_LR via Adam (discarded after training)
-    # - vectors/scalars use SCALAR_LR via Adam
+    MODULATION_PATTERNS = ("gate_", "adapt_", "private_")
     all_named_params = list(base_model.named_parameters())
-    matrix_params = [
+    shared_matrix_params = [
         p for name, p in all_named_params
-        if (name.startswith("blocks.") or name.startswith("shared_mlp.")) and p.ndim == 2
+        if name.startswith("shared_mlp.") and p.ndim == 2
+    ]
+    block_matrix_params = [
+        p for name, p in all_named_params
+        if name.startswith("blocks.") and p.ndim == 2
         and not any(pattern in name for pattern in CONTROL_TENSOR_NAME_PATTERNS)
+        and not any(mod in name for mod in MODULATION_PATTERNS)
+    ]
+    modulation_params = [
+        p for name, p in all_named_params
+        if name.startswith("blocks.") and any(mod in name for mod in MODULATION_PATTERNS)
     ]
     scalar_params = [
         p for name, p in all_named_params
-        if name == "skip_weights" or (name.startswith("blocks.") and (p.ndim < 2 or any(pattern in name for pattern in CONTROL_TENSOR_NAME_PATTERNS)))
+        if name == "skip_weights" or (
+            name.startswith("blocks.")
+            and not any(mod in name for mod in MODULATION_PATTERNS)
+            and (p.ndim < 2 or any(pattern in name for pattern in CONTROL_TENSOR_NAME_PATTERNS))
+        )
     ]
     mtp_params = [p for name, p in all_named_params if name.startswith("mtp_head_list.")]
     token_lr = args.tied_embed_lr if args.tie_embeddings else args.embed_lr
@@ -1004,21 +1026,35 @@ def main() -> None:
         eps=args.adam_eps,
         fused=True,
     )
-    optimizer_muon = Muon(
-        matrix_params,
+    optimizer_muon_shared = Muon(
+        shared_matrix_params,
+        lr=args.shared_matrix_lr,
+        momentum=args.shared_momentum_max,
+        backend_steps=args.muon_backend_steps,
+    )
+    for group in optimizer_muon_shared.param_groups:
+        group["base_lr"] = args.shared_matrix_lr
+    optimizer_muon_block = Muon(
+        block_matrix_params,
         lr=args.matrix_lr,
         momentum=args.muon_momentum,
         backend_steps=args.muon_backend_steps,
     )
-    for group in optimizer_muon.param_groups:
+    for group in optimizer_muon_block.param_groups:
         group["base_lr"] = args.matrix_lr
+    optimizer_modulation = torch.optim.Adam(
+        [{"params": modulation_params, "lr": args.modulation_lr, "base_lr": args.modulation_lr}],
+        betas=(args.beta1, args.beta2),
+        eps=args.adam_eps,
+        fused=True,
+    )
     optimizer_scalar = torch.optim.Adam(
         [{"params": scalar_params, "lr": args.scalar_lr, "base_lr": args.scalar_lr}],
         betas=(args.beta1, args.beta2),
         eps=args.adam_eps,
         fused=True,
     )
-    optimizers: list[torch.optim.Optimizer] = [optimizer_tok, optimizer_muon, optimizer_scalar]
+    optimizers: list[torch.optim.Optimizer] = [optimizer_tok, optimizer_muon_shared, optimizer_muon_block, optimizer_modulation, optimizer_scalar]
     if base_model.lm_head is not None:
         optimizer_head = torch.optim.Adam(
             [{"params": [base_model.lm_head.weight], "lr": args.head_lr, "base_lr": args.head_lr}],
@@ -1046,7 +1082,8 @@ def main() -> None:
     log0(
         f"tie_embeddings:{args.tie_embeddings} embed_lr:{token_lr} "
         f"head_lr:{args.head_lr if base_model.lm_head is not None else 0.0} "
-        f"matrix_lr:{args.matrix_lr} scalar_lr:{args.scalar_lr}"
+        f"matrix_lr:{args.matrix_lr} shared_matrix_lr:{args.shared_matrix_lr} "
+        f"modulation_lr:{args.modulation_lr} scalar_lr:{args.scalar_lr}"
     )
     log0(
         f"train_batch_tokens:{args.train_batch_tokens} train_seq_len:{args.train_seq_len} "
@@ -1165,9 +1202,14 @@ def main() -> None:
         train_loss /= grad_accum_steps
 
         frac = min(step / args.muon_momentum_warmup_steps, 1.0) if args.muon_momentum_warmup_steps > 0 else 1.0
-        muon_momentum = (1 - frac) * args.muon_momentum_warmup_start + frac * args.muon_momentum
-        for group in optimizer_muon.param_groups:
-            group["momentum"] = muon_momentum
+        # Shared MLP Muon: warmup to SHARED_MOMENTUM_MAX (conservative)
+        shared_muon_momentum = (1 - frac) * args.muon_momentum_warmup_start + frac * args.shared_momentum_max
+        for group in optimizer_muon_shared.param_groups:
+            group["momentum"] = shared_muon_momentum
+        # Block Muon: warmup to 0.95 (existing behavior)
+        block_muon_momentum = (1 - frac) * args.muon_momentum_warmup_start + frac * args.muon_momentum
+        for group in optimizer_muon_block.param_groups:
+            group["momentum"] = block_muon_momentum
 
         for opt in optimizers:
             for group in opt.param_groups:
