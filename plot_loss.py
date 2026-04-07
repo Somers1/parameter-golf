@@ -180,6 +180,8 @@ def main():
                         help="Plot val_bpb or val_loss (default: bpb)")
     parser.add_argument("--filter", type=str, default=None,
                         help="Only plot logs matching this substring")
+    parser.add_argument("--exclude", type=str, nargs="+", default=[],
+                        help="Exclude logs matching any of these substrings")
     parser.add_argument("logs", nargs="*", help="Specific log files to plot (default: all in logs/)")
     args = parser.parse_args()
 
@@ -193,6 +195,9 @@ def main():
 
     if args.filter:
         log_files = [f for f in log_files if args.filter in f.name]
+    if args.exclude:
+        log_files = [f for f in log_files
+                     if not any(ex in f.name for ex in args.exclude)]
 
     if not log_files:
         print("No log files found.")
