@@ -20,7 +20,7 @@ def sync_logs(ssh_host: str, ssh_key: str) -> None:
     ssh_opts = ["-i", ssh_key, "-o", "StrictHostKeyChecking=no"]
     # scp with wildcard — use shell to expand the glob on remote side
     print(f"Syncing logs from {ssh_host}...")
-    cmd = f'scp {" ".join(ssh_opts)} "{ssh_host}:{REMOTE_LOGS}*.txt" "{LOCAL_LOGS}/"'
+    cmd = f'scp -O {" ".join(ssh_opts)} "{ssh_host}:{REMOTE_LOGS}*.txt" "{LOCAL_LOGS}/"'
     result = subprocess.run(cmd, shell=True, capture_output=True, text=True)
     if result.returncode != 0:
         # Check if it's just "no match" vs real error
