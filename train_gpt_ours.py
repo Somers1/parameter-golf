@@ -778,22 +778,23 @@ class Block(nn.Module):
 
         normed = self.mlp_norm(x)
         if self.use_banks:
-            # Select top-k banks, compute soft weights for gradient flow
+            # Keep module indexing static for torch.compile by iterating over all banks
+            # and applying sparse top-k weights as tensors.
             _, top_idx = torch.topk(self.bank_logits, self.active_banks)
             top_scores = torch.softmax(self.bank_logits[top_idx], dim=0)
-            # Compute each selected bank and weight its output
+            bank_weights = torch.zeros_like(self.bank_logits)
+            bank_weights.scatter_(0, top_idx, top_scores)
             mlp_out = torch.zeros_like(x)
-            for i in range(self.active_banks):
-                bank_id = top_idx[i]
-                w = top_scores[i]
-                h = shared_mlp.bank_fc[bank_id](normed)
+            for bank_id, (bank_fc, bank_proj) in enumerate(zip(shared_mlp.bank_fc, shared_mlp.bank_proj)):
+                w = bank_weights[bank_id].to(dtype=x.dtype)
+                h = bank_fc(normed)
                 if self.has_adapt:
                     h = h + self.adapt_up_B(self.adapt_up_A(normed))
                 h = torch.relu(h).square()
                 if self.has_gate:
                     gate = torch.tanh(self.gate_up(self.gate_down(normed)))
                     h = h * (1.0 + gate)
-                bank_out = shared_mlp.bank_proj[bank_id](h)
+                bank_out = bank_proj(h)
                 if self.has_adapt:
                     bank_out = bank_out + self.adapt_down_B(self.adapt_down_A(h))
                 mlp_out = mlp_out + w * bank_out
