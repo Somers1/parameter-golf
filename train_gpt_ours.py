@@ -1063,7 +1063,7 @@ def main() -> None:
         f"tie_embeddings:{args.tie_embeddings} embed_lr:{token_lr} "
         f"head_lr:{args.head_lr if base_model.lm_head is not None else 0.0} "
         f"matrix_lr:{args.matrix_lr} scalar_lr:{args.scalar_lr} "
-        f"ema_shared_beta:{args.ema_shared_beta} ema_shared_start:{args.ema_shared_start}"
+        f"ema_shared_beta:{args.ema_shared_beta} ema_shared_start_frac:{args.ema_shared_start_frac}"
     )
     log0(
         f"train_batch_tokens:{args.train_batch_tokens} train_seq_len:{args.train_seq_len} "
