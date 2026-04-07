@@ -690,11 +690,11 @@ class SharedMLP(nn.Module):
         if num_banks > 0:
             assert total_width % num_banks == 0, f"mlp_width ({total_width}) must be divisible by num_banks ({num_banks})"
             self.bank_width = total_width // num_banks
-            # Separate modules per bank — clean dense ops, torch.compile friendly
-            self.bank_fc = nn.ModuleList([CastedLinear(dim, self.bank_width, bias=False) for _ in range(num_banks)])
-            self.bank_proj = nn.ModuleList([CastedLinear(self.bank_width, dim, bias=False) for _ in range(num_banks)])
-            for p in self.bank_proj:
-                p._zero_init = True
+            self.fc = CastedLinear(dim, total_width, bias=False)
+            self.proj = CastedLinear(total_width, dim, bias=False)
+            self.proj._zero_init = True
+            bank_row_index = torch.arange(total_width, dtype=torch.int64).reshape(num_banks, self.bank_width)
+            self.register_buffer("bank_row_index", bank_row_index, persistent=False)
         else:
             self.bank_width = total_width
             self.fc = CastedLinear(dim, total_width, bias=False)
@@ -778,23 +778,23 @@ class Block(nn.Module):
 
         normed = self.mlp_norm(x)
         if self.use_banks:
-            # Keep module indexing static for torch.compile by iterating over all banks
-            # and applying sparse top-k weights as tensors.
+            # Gather only the selected bank slices from the shared 2D weights.
             _, top_idx = torch.topk(self.bank_logits, self.active_banks)
             top_scores = torch.softmax(self.bank_logits[top_idx], dim=0)
-            bank_weights = torch.zeros_like(self.bank_logits)
-            bank_weights.scatter_(0, top_idx, top_scores)
             mlp_out = torch.zeros_like(x)
-            for bank_id, (bank_fc, bank_proj) in enumerate(zip(shared_mlp.bank_fc, shared_mlp.bank_proj)):
-                w = bank_weights[bank_id].to(dtype=x.dtype)
-                h = bank_fc(normed)
+            fc_weight = shared_mlp.fc.weight.to(normed.dtype)
+            proj_weight = shared_mlp.proj.weight.to(normed.dtype)
+            for i in range(self.active_banks):
+                bank_rows = shared_mlp.bank_row_index[top_idx[i]]
+                w = top_scores[i].to(dtype=x.dtype)
+                h = F.linear(normed, fc_weight.index_select(0, bank_rows))
                 if self.has_adapt:
                     h = h + self.adapt_up_B(self.adapt_up_A(normed))
                 h = torch.relu(h).square()
                 if self.has_gate:
                     gate = torch.tanh(self.gate_up(self.gate_down(normed)))
                     h = h * (1.0 + gate)
-                bank_out = bank_proj(h)
+                bank_out = F.linear(h, proj_weight.index_select(1, bank_rows))
                 if self.has_adapt:
                     bank_out = bank_out + self.adapt_down_B(self.adapt_down_A(h))
                 mlp_out = mlp_out + w * bank_out
@@ -1037,7 +1037,7 @@ def main() -> None:
         if isinstance(module, CastedLinear):
             module.float()
     restore_low_dim_params_to_fp32(base_model)
-    compiled_model = torch.compile(base_model, dynamic=False, fullgraph=True)
+    compiled_model = torch.compile(base_model, dynamic=False, fullgraph=False)
     model: nn.Module = DDP(compiled_model, device_ids=[local_rank], broadcast_buffers=False) if distributed else compiled_model
 
     # Optimizer split:
