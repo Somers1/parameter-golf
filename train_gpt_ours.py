@@ -711,17 +711,17 @@ class Block(nn.Module):
         self.mlp_scale = nn.Parameter(torch.ones(dim, dtype=torch.float32))
         self.resid_mix = nn.Parameter(torch.stack((torch.ones(dim), torch.zeros(dim))).float())
 
-        # Bank routing: each layer selects top-k banks from the shared MLP
+        # Bank routing: each layer uses a fixed subset of banks from the shared MLP
         self.use_banks = num_banks > 0 and active_banks > 0
         if self.use_banks:
-            self.num_banks = num_banks
-            self.active_banks = active_banks
+            assert mlp_width % num_banks == 0, f"mlp_width ({mlp_width}) must be divisible by num_banks ({num_banks})"
+            assert 0 < active_banks <= num_banks, f"active_banks ({active_banks}) must be in [1, {num_banks}]"
             self.bank_width = mlp_width // num_banks
-            # Learned per-layer bank scores — diverse init so layers start with different preferences
-            self.bank_scores = nn.Parameter(torch.zeros(num_banks, dtype=torch.float32))
-            with torch.no_grad():
-                for b in range(num_banks):
-                    self.bank_scores.data[b] = 1.0 if (b % num_banks) == (layer_idx % num_banks) else -1.0
+            # Fixed round-robin assignment: each layer gets a different set of banks
+            bank_ids = [(layer_idx + b) % num_banks for b in range(active_banks)]
+            bank_ids.sort()
+            col_ranges = [torch.arange(b * self.bank_width, (b + 1) * self.bank_width) for b in bank_ids]
+            self.register_buffer("bank_cols", torch.cat(col_ranges))
             active_width = self.bank_width * active_banks
         else:
             active_width = mlp_width
@@ -767,16 +767,8 @@ class Block(nn.Module):
 
         normed = self.mlp_norm(x)
         if self.use_banks:
-            # Select top-k banks by learned scores
-            _, bank_idx = torch.topk(self.bank_scores, self.active_banks, sorted=True)
-            bank_idx, _ = bank_idx.sort()  # keep contiguous order for efficiency
-            # Gather selected columns from fc and rows from proj
-            col_indices = []
-            for b in bank_idx:
-                start = b.item() * self.bank_width
-                col_indices.append(torch.arange(start, start + self.bank_width, device=normed.device))
-            col_indices = torch.cat(col_indices)
-            fc_w = shared_mlp.fc.weight[col_indices, :].to(normed.dtype)
+            # Use only selected bank columns/rows — precomputed indices
+            fc_w = shared_mlp.fc.weight[self.bank_cols, :].to(normed.dtype)
             h = F.linear(normed, fc_w)
             if self.has_adapt:
                 h = h + self.adapt_up_B(self.adapt_up_A(normed))
@@ -784,7 +776,7 @@ class Block(nn.Module):
             if self.has_gate:
                 gate = torch.tanh(self.gate_up(self.gate_down(normed)))
                 h = h * (1.0 + gate)
-            proj_w = shared_mlp.proj.weight[:, col_indices].to(h.dtype)
+            proj_w = shared_mlp.proj.weight[:, self.bank_cols].to(h.dtype)
             mlp_out = F.linear(h, proj_w)
             if self.has_adapt:
                 mlp_out = mlp_out + self.adapt_down_B(self.adapt_down_A(h))
