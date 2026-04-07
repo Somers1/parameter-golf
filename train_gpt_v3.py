@@ -49,6 +49,8 @@ class Hyperparameters:
     model_dim = int(os.environ.get("MODEL_DIM", 512))
     num_heads = int(os.environ.get("NUM_HEADS", 8))
     mlp_mult = float(os.environ.get("MLP_MULT", 3.0))
+    mlp_rank = int(os.environ.get("MLP_RANK", 0))  # 0 = standard dense MLP (bank path)
+    adapt_rank = int(os.environ.get("ADAPT_RANK", 0))  # 0 = no LoRA adapter
     tie_embeddings = bool(int(os.environ.get("TIE_EMBEDDINGS", "1")))
     rope_base = float(os.environ.get("ROPE_BASE", 10000.0))
     logit_softcap = float(os.environ.get("LOGIT_SOFTCAP", 30.0))
@@ -91,9 +93,6 @@ class Hyperparameters:
     ve_layers = os.environ.get("VE_LAYERS", "9,10")
     gated_attention = bool(int(os.environ.get("GATED_ATTENTION", "0")))
     value_residual = bool(int(os.environ.get("VALUE_RESIDUAL", "0")))  # VRL with sigmoid gates (off by default, risky)
-    # Compressed MLP + LoRA adapter (0 = standard dense MLP via banks, identical to baseline)
-    mlp_rank = int(os.environ.get("MLP_RANK", 0))
-    adapt_rank = int(os.environ.get("ADAPT_RANK", 0))
     # GPTQ calibration
     gptq_calib_batches = int(os.environ.get("GPTQ_CALIB_BATCHES", 256))
     gptq_block_size = int(os.environ.get("GPTQ_BLOCK_SIZE", 128))
@@ -734,31 +733,27 @@ class ValueEmbedding(nn.Module):
 class MLP(nn.Module):
     def __init__(self, dim: int, mlp_mult: int, mlp_rank: int = 0, adapt_rank: int = 0):
         super().__init__()
-        hidden = int(mlp_mult * dim)
         self.has_bottleneck = mlp_rank > 0
         if self.has_bottleneck:
-            # Compressed: dim -> mlp_rank -> hidden -> mlp_rank -> dim
-            # These layers are NOT banked -- they use CastedLinear directly
+            hidden = mlp_mult * dim
             self.fc_down = CastedLinear(dim, mlp_rank, bias=False)
             self.fc_up = CastedLinear(mlp_rank, hidden, bias=False)
             self.proj_down = CastedLinear(hidden, mlp_rank, bias=False)
             self.proj_up = CastedLinear(mlp_rank, dim, bias=False)
             self.proj_up._zero_init = True
-        # else: weights come from banks (up_w, down_w passed in forward)
-
         self.has_adapt = adapt_rank > 0
         if self.has_adapt:
             self.adapt_A = CastedLinear(dim, adapt_rank, bias=False)
             self.adapt_B = CastedLinear(adapt_rank, dim, bias=False)
             self.adapt_B._zero_init = True
 
-    def forward(self, x: Tensor, up_w: Tensor | None = None, down_w: Tensor | None = None) -> Tensor:
+    def forward(self, x: Tensor, up_w: Tensor, down_w: Tensor) -> Tensor:
         if self.has_bottleneck:
-            h = F.leaky_relu(self.fc_up(self.fc_down(x)), negative_slope=0.5)
-            out = self.proj_up(self.proj_down(h.square()))
+            h = F.leaky_relu(self.fc_up(self.fc_down(x)), negative_slope=0.5).square()
+            out = self.proj_up(self.proj_down(h))
         else:
-            out = F.leaky_relu(F.linear(x, up_w.to(x.dtype)), negative_slope=0.5)
-            out = F.linear(out.square(), down_w.to(x.dtype))
+            h = F.leaky_relu(F.linear(x, up_w.to(x.dtype)), negative_slope=0.5)
+            out = F.linear(h.square(), down_w.to(x.dtype))
         if self.has_adapt:
             out = out + self.adapt_B(self.adapt_A(x))
         return out
@@ -838,6 +833,7 @@ class GPT(nn.Module):
         adapt_rank: int = 0,
     ):
         super().__init__()
+        self.mlp_rank = mlp_rank
         self._ve_target_dim = num_kv_heads * (model_dim // num_heads)  # kv_dim for value projection
         if logit_softcap <= 0.0:
             raise ValueError(f"logit_softcap must be positive, got {logit_softcap}")
@@ -859,17 +855,10 @@ class GPT(nn.Module):
         kv_dim = num_kv_heads * head_dim
         mlp_dim = int(mlp_mult * model_dim)
         self.num_layers = num_layers
-        self.mlp_rank = mlp_rank
         self.qo_bank = nn.Parameter(torch.empty(2 * num_layers, model_dim, model_dim))
         self.kv_bank = nn.Parameter(torch.empty(2 * num_layers, kv_dim, model_dim))
-        # MLP banks only used when mlp_rank == 0 (standard dense MLP via banks)
-        if mlp_rank == 0:
-            self.mlp_up_bank = nn.Parameter(torch.empty(num_layers, mlp_dim, model_dim))
-            self.mlp_down_bank = nn.Parameter(torch.empty(num_layers, model_dim, mlp_dim))
-        else:
-            # Compressed MLP: weights live inside Block.mlp as CastedLinear layers
-            self.mlp_up_bank = None
-            self.mlp_down_bank = None
+        self.mlp_up_bank = nn.Parameter(torch.empty(num_layers, mlp_dim, model_dim))
+        self.mlp_down_bank = nn.Parameter(torch.empty(num_layers, model_dim, mlp_dim))
         self.blocks = nn.ModuleList(
             [
                 Block(
@@ -930,13 +919,11 @@ class GPT(nn.Module):
             nn.init.zeros_(self.qo_bank.data[n + i])                    # Out (zero init)
             nn.init.orthogonal_(self.kv_bank.data[i], gain=1.0)        # K
             nn.init.orthogonal_(self.kv_bank.data[n + i], gain=1.0)    # V
-            if self.mlp_up_bank is not None:
-                nn.init.orthogonal_(self.mlp_up_bank.data[i], gain=1.0)    # MLP up
-                nn.init.zeros_(self.mlp_down_bank.data[i])                  # MLP down (zero init)
+            nn.init.orthogonal_(self.mlp_up_bank.data[i], gain=1.0)    # MLP up
+            nn.init.zeros_(self.mlp_down_bank.data[i])                  # MLP down (zero init)
             # Scale proj layers (out_proj and mlp_down are "proj" layers)
             self.qo_bank.data[n + i].mul_(proj_scale)
-            if self.mlp_down_bank is not None:
-                self.mlp_down_bank.data[i].mul_(proj_scale)
+            self.mlp_down_bank.data[i].mul_(proj_scale)
         # Init remaining nn.Linear modules (bigram proj, mtp heads, lm_head)
         for name, module in self.named_modules():
             if isinstance(module, nn.Linear):
@@ -966,11 +953,9 @@ class GPT(nn.Module):
         ve_cache: dict = {}
         for i in range(self.num_encoder_layers):
             ve = self._get_ve(i, input_ids, ve_cache)
-            up_w = self.mlp_up_bank[i] if self.mlp_up_bank is not None else None
-            dn_w = self.mlp_down_bank[i] if self.mlp_down_bank is not None else None
             x, raw_v = self.blocks[i](x, x0,
                 self.qo_bank[i], self.kv_bank[i], self.kv_bank[n + i],
-                self.qo_bank[n + i], up_w, dn_w,
+                self.qo_bank[n + i], self.mlp_up_bank[i], self.mlp_down_bank[i],
                 v_embed=ve, v0=v0)
             if v0 is None and raw_v is not None:
                 v0 = raw_v
@@ -980,11 +965,9 @@ class GPT(nn.Module):
             if skips:
                 x = x + self.skip_weights[i].to(dtype=x.dtype)[None, None, :] * skips.pop()
             ve = self._get_ve(bi, input_ids, ve_cache)
-            up_w = self.mlp_up_bank[bi] if self.mlp_up_bank is not None else None
-            dn_w = self.mlp_down_bank[bi] if self.mlp_down_bank is not None else None
             x, _ = self.blocks[bi](x, x0,
                 self.qo_bank[bi], self.kv_bank[bi], self.kv_bank[n + bi],
-                self.qo_bank[n + bi], up_w, dn_w,
+                self.qo_bank[n + bi], self.mlp_up_bank[bi], self.mlp_down_bank[bi],
                 v_embed=ve, v0=v0)
         x = self.final_norm(x)
         x_flat = x.reshape(-1, x.size(-1))
@@ -1028,11 +1011,9 @@ class GPT(nn.Module):
         ve_cache: dict = {}
         for i in range(self.num_encoder_layers):
             ve = self._get_ve(i, input_ids, ve_cache)
-            up_w = self.mlp_up_bank[i] if self.mlp_up_bank is not None else None
-            dn_w = self.mlp_down_bank[i] if self.mlp_down_bank is not None else None
             x, raw_v = self.blocks[i](x, x0,
                 self.qo_bank[i], self.kv_bank[i], self.kv_bank[n + i],
-                self.qo_bank[n + i], up_w, dn_w,
+                self.qo_bank[n + i], self.mlp_up_bank[i], self.mlp_down_bank[i],
                 v_embed=ve, v0=v0)
             if v0 is None and raw_v is not None:
                 v0 = raw_v
@@ -1042,11 +1023,9 @@ class GPT(nn.Module):
             if skips:
                 x = x + self.skip_weights[i].to(dtype=x.dtype)[None, None, :] * skips.pop()
             ve = self._get_ve(bi, input_ids, ve_cache)
-            up_w = self.mlp_up_bank[bi] if self.mlp_up_bank is not None else None
-            dn_w = self.mlp_down_bank[bi] if self.mlp_down_bank is not None else None
             x, _ = self.blocks[bi](x, x0,
                 self.qo_bank[bi], self.kv_bank[bi], self.kv_bank[n + bi],
-                self.qo_bank[n + bi], up_w, dn_w,
+                self.qo_bank[n + bi], self.mlp_up_bank[bi], self.mlp_down_bank[bi],
                 v_embed=ve, v0=v0)
         x = self.final_norm(x)
         if self.tie_embeddings:
@@ -1354,9 +1333,8 @@ def _rebank_state_dict(sd: dict[str, Tensor], num_layers: int, template_sd: dict
             consumed.add(dk)
     out["qo_bank"] = torch.stack(qo_slices).to(dtype=template_sd["qo_bank"].dtype)
     out["kv_bank"] = torch.stack(kv_slices).to(dtype=template_sd["kv_bank"].dtype)
-    if "mlp_up_bank" in template_sd:
-        out["mlp_up_bank"] = torch.stack(up_slices).to(dtype=template_sd["mlp_up_bank"].dtype)
-        out["mlp_down_bank"] = torch.stack(down_slices).to(dtype=template_sd["mlp_down_bank"].dtype)
+    out["mlp_up_bank"] = torch.stack(up_slices).to(dtype=template_sd["mlp_up_bank"].dtype)
+    out["mlp_down_bank"] = torch.stack(down_slices).to(dtype=template_sd["mlp_down_bank"].dtype)
     for name, tensor in sd.items():
         if name not in consumed:
             out[name] = tensor
@@ -1407,39 +1385,20 @@ class _HessianAttn(nn.Module):
 
 class _HessianMLP(nn.Module):
     """Non-banked MLP with CastedLinear layers for Hessian hooks."""
-    def __init__(self, dim, mlp_mult, mlp_rank=0, adapt_rank=0):
+    def __init__(self, dim, mlp_mult):
         super().__init__()
-        hidden = int(mlp_mult * dim)
-        self.has_bottleneck = mlp_rank > 0
-        if self.has_bottleneck:
-            self.fc_down = CastedLinear(dim, mlp_rank, bias=False)
-            self.fc_up = CastedLinear(mlp_rank, hidden, bias=False)
-            self.proj_down = CastedLinear(hidden, mlp_rank, bias=False)
-            self.proj_up = CastedLinear(mlp_rank, dim, bias=False)
-        else:
-            self.fc = CastedLinear(dim, hidden, bias=False)
-            self.proj = CastedLinear(hidden, dim, bias=False)
-        self.has_adapt = adapt_rank > 0
-        if self.has_adapt:
-            self.adapt_A = CastedLinear(dim, adapt_rank, bias=False)
-            self.adapt_B = CastedLinear(adapt_rank, dim, bias=False)
+        self.fc = CastedLinear(dim, int(mlp_mult * dim), bias=False)
+        self.proj = CastedLinear(int(mlp_mult * dim), dim, bias=False)
     def forward(self, x):
-        if self.has_bottleneck:
-            h = F.leaky_relu(self.fc_up(self.fc_down(x)), negative_slope=0.5)
-            out = self.proj_up(self.proj_down(h.square()))
-        else:
-            out = self.proj(F.leaky_relu(self.fc(x), negative_slope=0.5).square())
-        if self.has_adapt:
-            out = out + self.adapt_B(self.adapt_A(x))
-        return out
+        return self.proj(F.leaky_relu(self.fc(x), negative_slope=0.5).square())
 
 class _HessianBlock(nn.Module):
-    def __init__(self, dim, num_heads, num_kv_heads, mlp_mult, rope_base, qk_gain_init, layer_idx=0, ln_scale=False, mlp_rank=0, adapt_rank=0):
+    def __init__(self, dim, num_heads, num_kv_heads, mlp_mult, rope_base, qk_gain_init, layer_idx=0, ln_scale=False):
         super().__init__()
         self.attn_norm = RMSNorm()
         self.mlp_norm = RMSNorm()
         self.attn = _HessianAttn(dim, num_heads, num_kv_heads, rope_base, qk_gain_init)
-        self.mlp = _HessianMLP(dim, mlp_mult, mlp_rank=mlp_rank, adapt_rank=adapt_rank)
+        self.mlp = _HessianMLP(dim, mlp_mult)
         self.attn_scale = nn.Parameter(torch.ones(dim, dtype=torch.float32))
         self.mlp_scale = nn.Parameter(torch.ones(dim, dtype=torch.float32))
         self.resid_mix = nn.Parameter(torch.stack((torch.ones(dim), torch.zeros(dim))).float())
@@ -1458,8 +1417,7 @@ class _HessianGPT(nn.Module):
                  mlp_mult, tie_embeddings, logit_softcap, rope_base, qk_gain_init,
                  bigram_vocab_size=0, bigram_dim=128, xsa_last_n=0,
                  rope_dims=0, ln_scale=False,
-                 ve_enabled=False, ve_dim=128, ve_layers="9,10",
-                 mlp_rank=0, adapt_rank=0):
+                 ve_enabled=False, ve_dim=128, ve_layers="9,10"):
         super().__init__()
         self.tie_embeddings = tie_embeddings
         self.logit_softcap = logit_softcap
@@ -1473,7 +1431,7 @@ class _HessianGPT(nn.Module):
         self.skip_weights = nn.Parameter(torch.ones(self.num_skip_weights, model_dim, dtype=torch.float32))
         self.blocks = nn.ModuleList([
             _HessianBlock(model_dim, num_heads, num_kv_heads, mlp_mult, rope_base, qk_gain_init,
-                          layer_idx=i, ln_scale=ln_scale, mlp_rank=mlp_rank, adapt_rank=adapt_rank)
+                          layer_idx=i, ln_scale=ln_scale)
             for i in range(num_layers)
         ])
         if rope_dims > 0:
@@ -1724,9 +1682,8 @@ def main() -> None:
     # Banks stay FP32 (like CastedLinear weights), cast to BF16 in forward
     base_model.qo_bank.data = base_model.qo_bank.data.float()
     base_model.kv_bank.data = base_model.kv_bank.data.float()
-    if base_model.mlp_up_bank is not None:
-        base_model.mlp_up_bank.data = base_model.mlp_up_bank.data.float()
-        base_model.mlp_down_bank.data = base_model.mlp_down_bank.data.float()
+    base_model.mlp_up_bank.data = base_model.mlp_up_bank.data.float()
+    base_model.mlp_down_bank.data = base_model.mlp_down_bank.data.float()
     for module in base_model.modules():
         if isinstance(module, CastedLinear):
             module.float()
@@ -1741,21 +1698,15 @@ def main() -> None:
     # - token embedding -> Adam
     # - scalars/control tensors -> Adam
     # - bigram proj, mtp heads, VE proj -> Adam (small matrix params not worth banking)
-    matrix_params = [base_model.qo_bank, base_model.kv_bank]
-    if base_model.mlp_up_bank is not None:
-        matrix_params.extend([base_model.mlp_up_bank, base_model.mlp_down_bank])
+    matrix_params = [
+        base_model.qo_bank, base_model.kv_bank,
+        base_model.mlp_up_bank, base_model.mlp_down_bank,
+    ]
     block_named_params = list(base_model.blocks.named_parameters())
     scalar_params = [
         p
         for name, p in block_named_params
         if p.ndim < 2 or any(pattern in name for pattern in CONTROL_TENSOR_NAME_PATTERNS)
-    ]
-    # Compressed MLP weights (CastedLinear inside blocks) -- only present when mlp_rank > 0
-    block_mlp_matrix_params = [
-        p
-        for name, p in block_named_params
-        if p.ndim >= 2 and "mlp." in name
-        and not any(pattern in name for pattern in CONTROL_TENSOR_NAME_PATTERNS)
     ]
     if base_model.skip_weights.numel() > 0:
         scalar_params.append(base_model.skip_weights)
@@ -1813,22 +1764,9 @@ def main() -> None:
             fused=True,
         )
         replicated_params.append(base_model.lm_head.weight)
-    # Compressed MLP matrix params (when mlp_rank > 0) use AdamW at matrix_lr
-    optimizer_block_mlp = None
-    if block_mlp_matrix_params:
-        optimizer_block_mlp = torch.optim.AdamW(
-            [{"params": block_mlp_matrix_params, "lr": args.matrix_lr, "base_lr": args.matrix_lr}],
-            betas=(args.beta1, args.beta2),
-            eps=args.adam_eps,
-            weight_decay=args.adam_wd,
-            fused=True,
-        )
-        replicated_params.extend(block_mlp_matrix_params)
     optimizers: list[torch.optim.Optimizer] = [optimizer_tok, optimizer_muon, optimizer_scalar]
     if optimizer_head is not None:
         optimizers.append(optimizer_head)
-    if optimizer_block_mlp is not None:
-        optimizers.append(optimizer_block_mlp)
     n_params = sum(p.numel() for p in base_model.parameters())
     mtp_params = sum(p.numel() for p in base_model.mtp_heads.parameters())
     log0(f"model_params:{n_params}")
@@ -2059,7 +1997,6 @@ def main() -> None:
         bigram_vocab_size=args.bigram_vocab_size, bigram_dim=args.bigram_dim,
         xsa_last_n=args.xsa_last_n, rope_dims=args.rope_dims, ln_scale=args.ln_scale,
         ve_enabled=args.ve_enabled, ve_dim=args.ve_dim, ve_layers=args.ve_layers,
-        mlp_rank=args.mlp_rank, adapt_rank=args.adapt_rank,
     ).to(device).bfloat16()
     for m in hessian_model.modules():
         if isinstance(m, CastedLinear):
@@ -2166,13 +2103,11 @@ def main() -> None:
         rope_dims=args.rope_dims, ln_scale=args.ln_scale, dtg=args.dtg_enabled,
         ve_enabled=args.ve_enabled, ve_dim=args.ve_dim, ve_layers=args.ve_layers,
         gated_attention=args.gated_attention, value_residual=args.value_residual,
-        mlp_rank=args.mlp_rank, adapt_rank=args.adapt_rank,
     ).to(device).bfloat16()
     eval_model.qo_bank.data = eval_model.qo_bank.data.float()
     eval_model.kv_bank.data = eval_model.kv_bank.data.float()
-    if eval_model.mlp_up_bank is not None:
-        eval_model.mlp_up_bank.data = eval_model.mlp_up_bank.data.float()
-        eval_model.mlp_down_bank.data = eval_model.mlp_down_bank.data.float()
+    eval_model.mlp_up_bank.data = eval_model.mlp_up_bank.data.float()
+    eval_model.mlp_down_bank.data = eval_model.mlp_down_bank.data.float()
     for m in eval_model.modules():
         if isinstance(m, CastedLinear):
             m.float()
