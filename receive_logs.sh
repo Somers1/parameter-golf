@@ -20,4 +20,4 @@ tar xzf logs.tar.gz
 rm logs.tar.gz
 
 echo ""
-echo "Logs synced. Run: python plot_loss.py --no-sync"
+echo "Logs synced"
