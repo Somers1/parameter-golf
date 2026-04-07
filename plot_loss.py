@@ -88,9 +88,9 @@ def plot(log_files: list[Path], metric: str = "bpb") -> None:
         # Shorten long auto-generated names
         if label.startswith("ours_"):
             label = label[5:]
-        # Truncate if still too long
-        if len(label) > 60:
-            label = label[:57] + "..."
+        # Truncate if extremely long
+        if len(label) > 100:
+            label = label[:97] + "..."
 
         # Plot train loss
         ax.plot(data["train_steps"], data["train_losses"],
@@ -107,7 +107,8 @@ def plot(log_files: list[Path], metric: str = "bpb") -> None:
     ax.set_xlabel("Step")
     ax.set_ylabel("Loss / BPB")
     ax.set_title("Parameter Golf Training Runs")
-    ax.legend(fontsize=7, loc="upper right")
+    ax.legend(fontsize=7, loc="upper center", bbox_to_anchor=(0.5, -0.12),
+              ncol=2, framealpha=0.9, handlelength=1.5)
     ax.grid(True, alpha=0.3)
 
     plt.tight_layout()
