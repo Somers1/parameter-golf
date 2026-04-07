@@ -1197,7 +1197,8 @@ def main() -> None:
         zero_grad_all()
 
         # Update EMA of shared MLP weights (start after ema_shared_start_frac of elapsed wall time)
-        ema_active = ema_shared_state and (max_wallclock_ms is None or approx_training_time_ms >= max_wallclock_ms * args.ema_shared_start_frac)
+        elapsed = approx_training_time_ms if step > 0 else 0.0
+        ema_active = ema_shared_state and (max_wallclock_ms is None or elapsed >= max_wallclock_ms * args.ema_shared_start_frac)
         if ema_active:
             beta = args.ema_shared_beta
             for name, p in base_model.named_parameters():
