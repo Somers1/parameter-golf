@@ -14,6 +14,12 @@ DEFAULT_SSH = "7eccm2gamj7h7y-64411faa@ssh.runpod.io"
 DEFAULT_KEY = os.path.expanduser("~/.ssh/id_ed25519")
 REMOTE_LOGS = "/workspace/parameter-golf/logs/"
 
+# Add substrings here to exclude runs from the plot
+EXCLUDE = [
+    # "w6144",
+    # "w3072_g16",
+]
+
 
 def sync_logs(ssh_host: str, ssh_key: str) -> None:
     LOCAL_LOGS.mkdir(exist_ok=True)
@@ -195,9 +201,10 @@ def main():
 
     if args.filter:
         log_files = [f for f in log_files if args.filter in f.name]
-    if args.exclude:
+    all_excludes = EXCLUDE + (args.exclude or [])
+    if all_excludes:
         log_files = [f for f in log_files
-                     if not any(ex in f.name for ex in args.exclude)]
+                     if not any(ex in f.name for ex in all_excludes)]
 
     if not log_files:
         print("No log files found.")
