@@ -35,7 +35,6 @@ ID_DEFAULT = {
     "PRIVATE_MLP_RANK": "0",
     "NUM_LAYERS": "9",
     "ATTEND_EVERY": "1",
-    "EMA_SHARED_BETA": "0",
     "GATE_LR_EARLY": "0.001",
     "GATE_LR_LATE": "0.08",
     "SHARED_LR_EARLY": "0.04",
@@ -126,9 +125,6 @@ class Hyperparameters:
     private_mlp_rank = int(os.environ.get("PRIVATE_MLP_RANK", 0))
     attend_every = int(os.environ.get("ATTEND_EVERY", 2))
 
-    # EMA for shared MLP weights (smooths gradient interference).
-    ema_shared_beta = float(os.environ.get("EMA_SHARED_BETA", 0))  # 0 = disabled, try 0.995 or 0.998
-    ema_shared_start_frac = float(os.environ.get("EMA_SHARED_START_FRAC", 0.1))  # fraction of warmdown start
 
     # MLA (Multi-head Latent Attention).
     q_latent = int(os.environ.get("Q_LATENT", 128))
@@ -1029,12 +1025,6 @@ def main() -> None:
     )
     optimizers: list[torch.optim.Optimizer] = [optimizer_tok, optimizer_muon, optimizer_scalar]
 
-    # EMA shadow copy of shared MLP weights
-    ema_shared_state = {}
-    if args.ema_shared_beta > 0:
-        for name, p in base_model.named_parameters():
-            if name.startswith("shared_mlp.") and p.ndim == 2:
-                ema_shared_state[name] = p.data.clone()
     if base_model.lm_head is not None:
         optimizer_head = torch.optim.Adam(
             [{"params": [base_model.lm_head.weight], "lr": args.head_lr, "base_lr": args.head_lr}],
@@ -1063,7 +1053,7 @@ def main() -> None:
         f"tie_embeddings:{args.tie_embeddings} embed_lr:{token_lr} "
         f"head_lr:{args.head_lr if base_model.lm_head is not None else 0.0} "
         f"matrix_lr:{args.matrix_lr} scalar_lr:{args.scalar_lr} "
-        f"ema_shared_beta:{args.ema_shared_beta} ema_shared_start_frac:{args.ema_shared_start_frac}"
+        f"matrix_lr:{args.matrix_lr} scalar_lr:{args.scalar_lr}"
     )
     log0(
         f"train_batch_tokens:{args.train_batch_tokens} train_seq_len:{args.train_seq_len} "
@@ -1196,15 +1186,6 @@ def main() -> None:
             opt.step()
         zero_grad_all()
 
-        # Update EMA of shared MLP weights (start after ema_shared_start_frac of elapsed wall time)
-        elapsed = approx_training_time_ms if step > 0 else 0.0
-        ema_active = ema_shared_state and (max_wallclock_ms is None or elapsed >= max_wallclock_ms * args.ema_shared_start_frac)
-        if ema_active:
-            beta = args.ema_shared_beta
-            for name, p in base_model.named_parameters():
-                if name in ema_shared_state:
-                    ema_shared_state[name].mul_(beta).add_(p.data, alpha=1 - beta)
-
         step += 1
         approx_training_time_ms = training_time_ms + 1000.0 * (time.perf_counter() - t0)
         should_log_train = (
@@ -1236,14 +1217,6 @@ def main() -> None:
     # -----------------------------
     # Save the raw state (useful for debugging/loading in PyTorch directly), then always produce
     # the compressed int8+zlib artifact and validate the round-tripped weights.
-
-    # Swap in EMA weights for shared MLP if enabled
-    if ema_shared_state:
-        log0("Swapping shared MLP weights with EMA shadow copy")
-        with torch.no_grad():
-            for name, p in base_model.named_parameters():
-                if name in ema_shared_state:
-                    p.data.copy_(ema_shared_state[name])
 
     # Strip MTP heads from saved state (training-only, not part of artifact)
     save_state = {k: v for k, v in base_model.state_dict().items() if not k.startswith("mtp_head_list.")}
