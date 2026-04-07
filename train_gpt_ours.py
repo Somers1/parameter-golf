@@ -35,10 +35,8 @@ ID_DEFAULT = {
     "PRIVATE_MLP_RANK": "0",
     "NUM_LAYERS": "9",
     "ATTEND_EVERY": "1",
-    "GATE_LR_EARLY": "0.001",
-    "GATE_LR_LATE": "0.08",
-    "SHARED_LR_EARLY": "0.04",
-    "SHARED_LR_LATE": "0.005",
+    "NUM_BANKS": "0",
+    "ACTIVE_BANKS": "0",
 }
 DEFAULTS.update(ID_DEFAULT)
 for k, v in DEFAULTS.items():
@@ -120,6 +118,8 @@ class Hyperparameters:
 
     # Shared MLP.
     mlp_width = int(os.environ.get("MLP_WIDTH", 2048))
+    num_banks = int(os.environ.get("NUM_BANKS", 0))  # 0 = no banking, use full width
+    active_banks = int(os.environ.get("ACTIVE_BANKS", 0))  # how many banks each layer uses
     gate_rank = int(os.environ.get("GATE_RANK", 32))
     adapt_rank = int(os.environ.get("ADAPT_RANK", 0))
     private_mlp_rank = int(os.environ.get("PRIVATE_MLP_RANK", 0))
@@ -684,18 +684,21 @@ class CausalSelfAttention(nn.Module):
 
 
 class SharedMLP(nn.Module):
-    def __init__(self, dim: int, total_width: int):
+    def __init__(self, dim: int, total_width: int, num_banks: int = 0):
         super().__init__()
         self.fc = CastedLinear(dim, total_width, bias=False)
         self.proj = CastedLinear(total_width, dim, bias=False)
         self.proj._zero_init = True
+        self.num_banks = num_banks
+        self.bank_width = total_width // num_banks if num_banks > 0 else total_width
 
 
 class Block(nn.Module):
     def __init__(self, dim: int, num_heads: int, num_kv_heads: int, rope_base: float,
                  qk_gain_init: float, q_latent: int, kv_latent: int, gate_rank: int,
                  adapt_rank: int, private_mlp_rank: int,
-                 layer_idx: int, mlp_width: int, has_attention: bool = True):
+                 layer_idx: int, mlp_width: int, num_banks: int = 0, active_banks: int = 0,
+                 has_attention: bool = True):
         super().__init__()
         self.has_attention = has_attention
         if has_attention:
@@ -708,27 +711,42 @@ class Block(nn.Module):
         self.mlp_scale = nn.Parameter(torch.ones(dim, dtype=torch.float32))
         self.resid_mix = nn.Parameter(torch.stack((torch.ones(dim), torch.zeros(dim))).float())
 
-        # Per-layer gate adapter (optional)
+        # Bank routing: each layer selects top-k banks from the shared MLP
+        self.use_banks = num_banks > 0 and active_banks > 0
+        if self.use_banks:
+            self.num_banks = num_banks
+            self.active_banks = active_banks
+            self.bank_width = mlp_width // num_banks
+            # Learned per-layer bank scores — diverse init so layers start with different preferences
+            self.bank_scores = nn.Parameter(torch.zeros(num_banks, dtype=torch.float32))
+            with torch.no_grad():
+                for b in range(num_banks):
+                    self.bank_scores.data[b] = 1.0 if (b % num_banks) == (layer_idx % num_banks) else -1.0
+            active_width = self.bank_width * active_banks
+        else:
+            active_width = mlp_width
+
+        # Per-layer gate adapter (optional) — operates on active width
         self.has_gate = gate_rank > 0
         if self.has_gate:
             self.gate_down = CastedLinear(dim, gate_rank, bias=False)
-            self.gate_up = CastedLinear(gate_rank, mlp_width, bias=False)
+            self.gate_up = CastedLinear(gate_rank, active_width, bias=False)
             # Diverse init: each layer emphasizes a different region of the MLP
             with torch.no_grad():
                 nn.init.zeros_(self.gate_up.weight)
-                t = torch.linspace(0, 2 * math.pi, mlp_width)
+                t = torch.linspace(0, 2 * math.pi, active_width)
                 for r in range(min(gate_rank, self.gate_up.weight.shape[1])):
                     freq = (layer_idx + 1) + r * 0.5
                     pattern = 0.05 * torch.sin(freq * t)
                     self.gate_up.weight.data[:, r] = pattern
 
-        # Per-layer LoRA adapters on shared MLP (optional)
+        # Per-layer LoRA adapters on shared MLP (optional) — operates on active width
         self.has_adapt = adapt_rank > 0
         if self.has_adapt:
             self.adapt_up_A = CastedLinear(dim, adapt_rank, bias=False)
-            self.adapt_up_B = CastedLinear(adapt_rank, mlp_width, bias=False)
+            self.adapt_up_B = CastedLinear(adapt_rank, active_width, bias=False)
             self.adapt_up_B._zero_init = True
-            self.adapt_down_A = CastedLinear(mlp_width, adapt_rank, bias=False)
+            self.adapt_down_A = CastedLinear(active_width, adapt_rank, bias=False)
             self.adapt_down_B = CastedLinear(adapt_rank, dim, bias=False)
             self.adapt_down_B._zero_init = True
 
@@ -748,16 +766,39 @@ class Block(nn.Module):
             x = x + self.attn_scale.to(dtype=x.dtype)[None, None, :] * attn_out
 
         normed = self.mlp_norm(x)
-        h = shared_mlp.fc(normed)
-        if self.has_adapt:
-            h = h + self.adapt_up_B(self.adapt_up_A(normed))
-        h = torch.relu(h).square()
-        if self.has_gate:
-            gate = torch.tanh(self.gate_up(self.gate_down(normed)))
-            h = h * (1.0 + gate)
-        mlp_out = shared_mlp.proj(h)
-        if self.has_adapt:
-            mlp_out = mlp_out + self.adapt_down_B(self.adapt_down_A(h))
+        if self.use_banks:
+            # Select top-k banks by learned scores
+            _, bank_idx = torch.topk(self.bank_scores, self.active_banks, sorted=True)
+            bank_idx, _ = bank_idx.sort()  # keep contiguous order for efficiency
+            # Gather selected columns from fc and rows from proj
+            col_indices = []
+            for b in bank_idx:
+                start = b.item() * self.bank_width
+                col_indices.append(torch.arange(start, start + self.bank_width, device=normed.device))
+            col_indices = torch.cat(col_indices)
+            fc_w = shared_mlp.fc.weight[col_indices, :].to(normed.dtype)
+            h = F.linear(normed, fc_w)
+            if self.has_adapt:
+                h = h + self.adapt_up_B(self.adapt_up_A(normed))
+            h = torch.relu(h).square()
+            if self.has_gate:
+                gate = torch.tanh(self.gate_up(self.gate_down(normed)))
+                h = h * (1.0 + gate)
+            proj_w = shared_mlp.proj.weight[:, col_indices].to(h.dtype)
+            mlp_out = F.linear(h, proj_w)
+            if self.has_adapt:
+                mlp_out = mlp_out + self.adapt_down_B(self.adapt_down_A(h))
+        else:
+            h = shared_mlp.fc(normed)
+            if self.has_adapt:
+                h = h + self.adapt_up_B(self.adapt_up_A(normed))
+            h = torch.relu(h).square()
+            if self.has_gate:
+                gate = torch.tanh(self.gate_up(self.gate_down(normed)))
+                h = h * (1.0 + gate)
+            mlp_out = shared_mlp.proj(h)
+            if self.has_adapt:
+                mlp_out = mlp_out + self.adapt_down_B(self.adapt_down_A(h))
         if self.has_private_mlp:
             private_h = torch.relu(self.private_up(normed)).square()
             mlp_out = mlp_out + self.private_down(private_h)
@@ -769,7 +810,8 @@ class GPT(nn.Module):
     def __init__(self, vocab_size: int, num_layers: int, model_dim: int, num_heads: int,
                  num_kv_heads: int, mlp_mult: int, tie_embeddings: bool, tied_embed_init_std: float,
                  logit_softcap: float, rope_base: float, qk_gain_init: float,
-                 mlp_width: int, gate_rank: int, adapt_rank: int,
+                 mlp_width: int, num_banks: int, active_banks: int,
+                 gate_rank: int, adapt_rank: int,
                  private_mlp_rank: int,
                  attend_every: int, q_latent: int, kv_latent: int, mtp_heads: int):
         super().__init__()
@@ -785,13 +827,14 @@ class GPT(nn.Module):
         self.num_skip_weights = min(self.num_encoder_layers, self.num_decoder_layers)
         self.skip_weights = nn.Parameter(torch.ones(self.num_skip_weights, model_dim, dtype=torch.float32))
 
-        # Shared MLP — every layer sees the full width, gates handle routing
-        self.shared_mlp = SharedMLP(model_dim, mlp_width)
+        # Shared MLP — banked or full-width
+        self.shared_mlp = SharedMLP(model_dim, mlp_width, num_banks)
 
         self.blocks = nn.ModuleList([
             Block(model_dim, num_heads, num_kv_heads, rope_base, qk_gain_init,
                   q_latent, kv_latent, gate_rank, adapt_rank, private_mlp_rank,
                   layer_idx=i, mlp_width=mlp_width,
+                  num_banks=num_banks, active_banks=active_banks,
                   has_attention=(i % attend_every == 0))
             for i in range(num_layers)
         ])
@@ -970,6 +1013,8 @@ def main() -> None:
         rope_base=args.rope_base,
         qk_gain_init=args.qk_gain_init,
         mlp_width=args.mlp_width,
+        num_banks=args.num_banks,
+        active_banks=args.active_banks,
         gate_rank=args.gate_rank,
         adapt_rank=args.adapt_rank,
         private_mlp_rank=args.private_mlp_rank,
