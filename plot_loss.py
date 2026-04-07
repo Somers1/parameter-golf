@@ -70,50 +70,103 @@ def parse_log(filepath: Path) -> dict:
     }
 
 
+def shorten_label(name: str) -> str:
+    """Turn verbose auto-generated run names into readable short labels."""
+    if name.startswith("ours_"):
+        name = name[5:]
+    # Extract key params and build a compact label
+    parts = []
+    replacements = [
+        ("mlp_width", "w"), ("mlp_window", "w"), ("gate_rank", "g"),
+        ("adapt_rank", "a"), ("private_mlp_rank", "p"), ("num_layers", "L"),
+        ("attend_every", "att"), ("q_latent", "ql"), ("kv_latent", "kvl"),
+        ("mtp_heads", "mtp"), ("model_dim", "d"), ("mlp_overlap", "ov"),
+    ]
+    for long, short in replacements:
+        idx = name.find(long)
+        if idx != -1:
+            # Extract the value after the key name
+            val_start = idx + len(long)
+            val = ""
+            for c in name[val_start:]:
+                if c == '_':
+                    break
+                val += c
+            if val and val != "0":
+                parts.append(f"{short}{val}")
+    return "_".join(parts) if parts else name[:50]
+
+
 def plot(log_files: list[Path], metric: str = "bpb") -> None:
     try:
         import matplotlib.pyplot as plt
+        import matplotlib.colors as mcolors
     except ImportError:
         print("matplotlib not installed. Install with: pip install matplotlib")
         sys.exit(1)
 
-    fig, ax = plt.subplots(figsize=(14, 7))
+    fig, (ax_train, ax_val) = plt.subplots(2, 1, figsize=(16, 10),
+                                            height_ratios=[1, 1])
+    fig.suptitle("Parameter Golf Training Runs", fontsize=14, fontweight="bold")
 
-    for filepath in log_files:
+    # Use a distinct color per run
+    colors = list(mcolors.TABLEAU_COLORS.values())
+
+    for i, filepath in enumerate(log_files):
         data = parse_log(filepath)
         if not data["train_steps"]:
             continue
 
         label = filepath.stem
-        # Shorten long auto-generated names
         if label.startswith("ours_"):
-            label = label[5:]
-        # Truncate if extremely long
-        if len(label) > 100:
-            label = label[:97] + "..."
+            label = shorten_label(label)
+        elif label == "baseline" or label == "baseline_proper":
+            pass  # keep as-is
+        color = colors[i % len(colors)]
 
-        # Plot train loss
-        ax.plot(data["train_steps"], data["train_losses"],
-                alpha=0.6, linewidth=1, label=f"{label} (train)")
+        # Train loss — top chart
+        ax_train.plot(data["train_steps"], data["train_losses"],
+                      color=color, alpha=0.8, linewidth=1.5, label=label)
 
-        # Plot val BPB or val loss as markers
+        # Val BPB — bottom chart
         if metric == "bpb" and data["val_bpbs"]:
-            ax.plot(data["val_steps"], data["val_bpbs"],
-                    "o-", markersize=5, linewidth=2, label=f"{label} (val_bpb)")
+            ax_val.plot(data["val_steps"], data["val_bpbs"],
+                        "o-", color=color, markersize=6, linewidth=2, label=label)
+            # Annotate final val_bpb
+            if data["val_bpbs"]:
+                ax_val.annotate(f"{data['val_bpbs'][-1]:.4f}",
+                                (data["val_steps"][-1], data["val_bpbs"][-1]),
+                                textcoords="offset points", xytext=(8, 0),
+                                fontsize=8, color=color, fontweight="bold")
         elif data["val_losses"]:
-            ax.plot(data["val_steps"], data["val_losses"],
-                    "o-", markersize=5, linewidth=2, label=f"{label} (val)")
+            ax_val.plot(data["val_steps"], data["val_losses"],
+                        "o-", color=color, markersize=6, linewidth=2, label=label)
 
-    ax.set_xlabel("Step")
-    ax.set_ylabel("Loss / BPB")
-    ax.set_title("Parameter Golf Training Runs")
-    ax.legend(fontsize=7, loc="upper center", bbox_to_anchor=(0.5, -0.12),
-              ncol=2, framealpha=0.9, handlelength=1.5)
-    ax.grid(True, alpha=0.3)
+    # Train chart formatting
+    ax_train.set_ylabel("Train Loss", fontsize=11)
+    ax_train.set_title("Training Loss", fontsize=11)
+    ax_train.grid(True, alpha=0.3)
+    ax_train.legend(fontsize=8, loc="upper right", framealpha=0.9)
+    # Cap y-axis to ignore early spikes
+    if ax_train.get_lines():
+        all_y = []
+        for line in ax_train.get_lines():
+            all_y.extend(line.get_ydata())
+        if all_y:
+            p95 = sorted(all_y)[int(len(all_y) * 0.95)]
+            ax_train.set_ylim(top=min(p95 * 1.2, max(all_y)))
+
+    # Val chart formatting
+    val_label = "Val BPB" if metric == "bpb" else "Val Loss"
+    ax_val.set_xlabel("Step", fontsize=11)
+    ax_val.set_ylabel(val_label, fontsize=11)
+    ax_val.set_title(f"Validation ({val_label})", fontsize=11)
+    ax_val.grid(True, alpha=0.3)
+    ax_val.legend(fontsize=8, loc="upper right", framealpha=0.9)
 
     plt.tight_layout()
     out_path = SCRIPT_DIR / "loss_plot.png"
-    plt.savefig(out_path, dpi=150)
+    plt.savefig(out_path, dpi=150, bbox_inches="tight")
     print(f"Saved plot to {out_path}")
     plt.show()
 
