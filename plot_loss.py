@@ -14,33 +14,11 @@ DEFAULT_SSH = "7eccm2gamj7h7y-64411faa@ssh.runpod.io"
 DEFAULT_KEY = os.path.expanduser("~/.ssh/id_ed25519")
 REMOTE_LOGS = "/workspace/parameter-golf/logs/"
 
-# Add log filenames here to exclude runs from the plot
-EXCLUDE = [
-    "baseline.txt",
-    "private_mlp_test.txt",
-    "12L_allatt_gate.txt",
-    "baseline.txt",
-    "d14_w2048_ov7.txt",
-    "deep16_8gpu.txt",
-    "deep16_gate_slide.txt",
-    "fullatt_11L.txt",
-    "fullatt_12L.txt",
-    "no_mla.txt",
-    "early_warmdown.txt",
-    "W4096_g128_p32_L12_att1_kvl64_8GPU.txt",
-    "ours_mlp_width6144_mtp_heads0_q_latent0_kv_latent64_gate_rank48_adapt_rank0_private_mlp_rank32_num_layers11_attend_every1.txt",
-    "ours_mlp_width3072_mtp_heads0_q_latent0_kv_latent64_gate_rank16_adapt_rank0_private_mlp_rank32_num_layers11_attend_every1.txt",
-    "ours_mlp_width3072_mtp_heads0_q_latent0_kv_latent64_gate_rank32_adapt_rank0_private_mlp_rank16_num_layers11_attend_every1.txt",
-    "ours_mlp_width3072_mtp_heads0_q_latent0_kv_latent64_gate_rank32_adapt_rank0_private_mlp_rank32_num_layers11_attend_every1.txt",
-    "ours_mlp_width3072_mtp_heads0_q_latent0_kv_latent64_gate_rank64_adapt_rank0_private_mlp_rank32_num_layers11_attend_every1.txt",
-    "ours_mlp_width2048_mtp_heads0_q_latent0_kv_latent64_gate_rank128_adapt_rank0_private_mlp_rank32_num_layers12_attend_every1.txt",
-    "ours_mlp_width6144_mtp_heads0_q_latent0_kv_latent64_gate_rank48_adapt_rank0_private_mlp_rank32_num_layers12_attend_every1.txt",
-    "ours_mlp_width4096_mtp_heads0_q_latent0_kv_latent128_gate_rank64_adapt_rank0_private_mlp_rank32_num_layers12_attend_every1.txt",
-    "ours_mlp_width4096_mtp_heads0_q_latent0_kv_latent64_gate_rank128_adapt_rank0_private_mlp_rank32_num_layers12_attend_every1.txt",
-    "basline.txt",
-    "staged_learning.txt"
-    # "W4096_g128_p32_L12_att1_kvl64_8GPU.txt",
-    # "native_basline.txt"
+# Add log filenames here to INCLUDE in the plot (empty = plot all)
+INCLUDE = [
+    # "golf_joint.txt",
+    # "engram_lite.txt",
+    # "engram_full.txt",
 ]
 
 
@@ -218,9 +196,10 @@ def main():
 
     if args.filter:
         log_files = [f for f in log_files if args.filter in f.name]
-    all_excludes = set(EXCLUDE + (args.exclude or []))
-    if all_excludes:
-        log_files = [f for f in log_files if f.name not in all_excludes]
+    if INCLUDE:
+        log_files = [f for f in log_files if f.name in INCLUDE]
+    if args.exclude:
+        log_files = [f for f in log_files if f.name not in set(args.exclude)]
 
     if not log_files:
         print("No log files found.")
