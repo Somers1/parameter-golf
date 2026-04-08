@@ -57,3 +57,12 @@ torchrun --standalone --nproc_per_node=8 train_gpt_ours.py
 RUN_ID=latent_larger NUM_LAYERS=12  VAL_LOSS_EVERY=200 KV_LATENT=64 torchrun --standalone --nproc_per_node=8 train_gpt_v2.py
 
 
+RUN_ID=golf_joint BIGRAM_VOCAB_SIZE=3072 BIGRAM_DIM=112 WARMDOWN_ITERS=4000 TARGET_MB=15.9 SEED=314 torchrun --standalone --nproc_per_node=8 train_gpt_v3.py
+
+
+RUN_ID=engram8 ENGRAM_LAYERS=2 BIGRAM_HEADS=1 BIGRAM_VOCAB_SIZE=3072 BIGRAM_DIM=112 WARMDOWN_ITERS=4000 TARGET_MB=15.9 SEED=314 torchrun --standalone --nproc_per_node=8 train_gpt_v3.py
+
+RUN_ID=engram_lite ENGRAM_LAYERS=6 BIGRAM_HEADS=1 \
+BIGRAM_VOCAB_SIZE=3072 BIGRAM_DIM=112 WARMDOWN_ITERS=4000 \
+TARGET_MB=15.9 SEED=314 \
+torchrun --standalone --nproc_per_node=8 train_gpt_v3.py

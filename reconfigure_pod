@@ -1,0 +1,7 @@
+cd ..
+mv parameter-golf/ parameter-golf_old
+git clone https://github.com/Somers1/parameter-golf.git
+cd parameter-golf
+mv ../parameter-golf_old/data/datasets data/datasets
+python3 data/cached_challenge_fineweb.py --variant sp1024
+
