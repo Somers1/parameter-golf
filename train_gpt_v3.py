@@ -717,6 +717,11 @@ class BigramHashEmbedding(nn.Module):
         out[..., 2:] = (36313 * t[..., 2:] ^ 27191 * t[..., 1:-1] ^ 51497 * t[..., :-2]) % mod
         return out.long()
     def forward(self, token_ids: Tensor) -> Tensor:
+        """Return scaled bigram embedding (for input injection)."""
+        h = self._embed_raw(token_ids)
+        return h * self.scale.to(dtype=h.dtype)
+    def _embed_raw(self, token_ids: Tensor) -> Tensor:
+        """Return unscaled projected bigram embedding (for engram gates)."""
         h = self.embed(self.bigram_hash(token_ids))
         if self._num_heads >= 2:
             h = h + self.embed(self.bigram_hash_head2(token_ids))
@@ -724,7 +729,7 @@ class BigramHashEmbedding(nn.Module):
             h = h + self.embed(self.trigram_hash(token_ids))
         if self.proj is not None:
             h = self.proj(h)
-        return h * self.scale.to(dtype=h.dtype)
+        return h
 class EngramGateLite(nn.Module):
     """Lightweight scalar gate: hidden → scalar → scale ngram_emb."""
     def __init__(self, model_dim: int):
@@ -982,11 +987,10 @@ class GPT(nn.Module):
         # Compute bigram once, reuse for both input injection and engram layers
         ngram_emb = None
         if self.bigram is not None:
-            ngram_emb = self.bigram(input_ids)
             if self._bigram_at_input:
-                x = x + ngram_emb
-        if not self._engram_layer_set:
-            ngram_emb = None
+                x = x + self.bigram(input_ids)
+            if self._engram_layer_set:
+                ngram_emb = self.bigram._embed_raw(input_ids)
         x = F.rms_norm(x, (x.size(-1),))
         x = self.smear(x)
         x0 = x
@@ -1045,11 +1049,10 @@ class GPT(nn.Module):
         x = self.tok_emb(input_ids)
         ngram_emb = None
         if self.bigram is not None:
-            ngram_emb = self.bigram(input_ids)
             if self._bigram_at_input:
-                x = x + ngram_emb
-        if not self._engram_layer_set:
-            ngram_emb = None
+                x = x + self.bigram(input_ids)
+            if self._engram_layer_set:
+                ngram_emb = self.bigram._embed_raw(input_ids)
         x = F.rms_norm(x, (x.size(-1),))
         x = self.smear(x)
         x0 = x
@@ -1517,11 +1520,10 @@ class _HessianGPT(nn.Module):
         x = self.tok_emb(input_ids)
         ngram_emb = None
         if self.bigram is not None:
-            ngram_emb = self.bigram(input_ids)
             if self._bigram_at_input:
-                x = x + ngram_emb
-        if not self._engram_layer_set:
-            ngram_emb = None
+                x = x + self.bigram(input_ids)
+            if self._engram_layer_set:
+                ngram_emb = self.bigram._embed_raw(input_ids)
         x = F.rms_norm(x, (x.size(-1),))
         x = self.smear(x)
         x0 = x
