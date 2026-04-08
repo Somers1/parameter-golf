@@ -362,7 +362,7 @@ CONTROL_TENSOR_NAME_PATTERNS = tuple(
     pattern
     for pattern in os.environ.get(
         "CONTROL_TENSOR_NAME_PATTERNS",
-        "attn_scale,attn_scales,mlp_scale,mlp_scales,resid_mix,resid_mixes,q_gain,skip_weight,skip_weights,smear,dtg_gate,ve_layer_scales,ve_shared.scale,attn_gate,vr_lambda",
+        "attn_scale,attn_scales,mlp_scale,mlp_scales,resid_mix,resid_mixes,q_gain,skip_weight,skip_weights,smear,dtg_gate,ve_layer_scales,ve_shared.scale,attn_gate,vr_lambda,engram_gate",
     ).split(",")
     if pattern
 )
@@ -775,6 +775,7 @@ class Block(nn.Module):
         dtg: bool = False,
         gated_attention: bool = False,
         value_residual: bool = False,
+        engram: bool = False,
     ):
         super().__init__()
         self.attn_norm = RMSNorm()
@@ -792,7 +793,13 @@ class Block(nn.Module):
             nn.init.constant_(self.dtg_gate.bias, 2.0)
         else:
             self.dtg_gate = None
-    def forward(self, x: Tensor, x0: Tensor, q_w: Tensor, k_w: Tensor, v_w: Tensor, out_w: Tensor, up_w: Tensor, down_w: Tensor, v_embed: Tensor | None = None, v0: Tensor | None = None) -> tuple[Tensor, Tensor | None]:
+        if engram:
+            self.engram_gate = EngramGate(dim)
+        else:
+            self.engram_gate = None
+    def forward(self, x: Tensor, x0: Tensor, q_w: Tensor, k_w: Tensor, v_w: Tensor, out_w: Tensor, up_w: Tensor, down_w: Tensor, v_embed: Tensor | None = None, v0: Tensor | None = None, ngram_emb: Tensor | None = None) -> tuple[Tensor, Tensor | None]:
+        if self.engram_gate is not None and ngram_emb is not None:
+            x = x + self.engram_gate(x, ngram_emb)
         mix = self.resid_mix.to(dtype=x.dtype)
         x_in = mix[0][None, None, :] * x + mix[1][None, None, :] * x0
         attn_out, raw_v = self.attn(self.attn_norm(x_in) * self.ln_scale_factor, q_w, k_w, v_w, out_w, v_embed=v_embed, v0=v0)
@@ -845,11 +852,7 @@ class GPT(nn.Module):
         self.mtp_loss_weight = mtp_loss_weight
         self.tok_emb = nn.Embedding(vocab_size, model_dim)
         self.bigram = BigramHashEmbedding(bigram_vocab_size, bigram_dim, model_dim, trigram=bool(int(os.environ.get("TRIGRAM", "0"))), num_heads=bigram_heads) if bigram_vocab_size > 0 else None
-        # Engram: gated n-gram injection at specific layers (empty = input-only original behaviour)
-        self.engram_layer_indices = [int(x) for x in engram_layers.split(",") if x.strip()] if engram_layers else []
-        self.engram_gates = nn.ModuleList(
-            [EngramGate(model_dim) for _ in self.engram_layer_indices]
-        ) if self.engram_layer_indices else nn.ModuleList()
+        self._engram_layer_set = set(int(x) for x in engram_layers.split(",") if x.strip()) if engram_layers else set()
         self.smear = SmearGate(model_dim)
         self.num_encoder_layers = num_layers // 2
         self.num_decoder_layers = num_layers - self.num_encoder_layers
@@ -878,6 +881,7 @@ class GPT(nn.Module):
                     dtg=dtg,
                     gated_attention=gated_attention,
                     value_residual=value_residual,
+                    engram=(i in self._engram_layer_set),
                 )
                 for i in range(num_layers)
             ]
@@ -943,12 +947,6 @@ class GPT(nn.Module):
         ve_base = ve_cache['ve'] if ve_cache is not None else self.ve_shared(input_ids)
         ve_idx = self.ve_layer_indices.index(layer_idx)
         return ve_base * self.ve_layer_scales[ve_idx].to(dtype=ve_base.dtype)
-    def _get_engram(self, layer_idx: int, hidden: Tensor, ngram_emb: Tensor | None) -> Tensor | None:
-        """Get gated n-gram injection for a specific layer."""
-        if ngram_emb is None or layer_idx not in self.engram_layer_indices:
-            return None
-        gate_idx = self.engram_layer_indices.index(layer_idx)
-        return self.engram_gates[gate_idx](hidden, ngram_emb)
     def forward(self, input_ids: Tensor, target_ids: Tensor) -> Tensor:
         n = self.num_layers
         x = self.tok_emb(input_ids)
@@ -957,7 +955,7 @@ class GPT(nn.Module):
         if self.bigram is not None:
             ngram_emb = self.bigram(input_ids)
             x = x + ngram_emb
-        if not self.engram_layer_indices:
+        if not self._engram_layer_set:
             ngram_emb = None
         x = F.rms_norm(x, (x.size(-1),))
         x = self.smear(x)
@@ -966,14 +964,11 @@ class GPT(nn.Module):
         skips: list[Tensor] = []
         ve_cache: dict = {}
         for i in range(self.num_encoder_layers):
-            engram_out = self._get_engram(i, x, ngram_emb)
-            if engram_out is not None:
-                x = x + engram_out
             ve = self._get_ve(i, input_ids, ve_cache)
             x, raw_v = self.blocks[i](x, x0,
                 self.qo_bank[i], self.kv_bank[i], self.kv_bank[n + i],
                 self.qo_bank[n + i], self.mlp_up_bank[i], self.mlp_down_bank[i],
-                v_embed=ve, v0=v0)
+                v_embed=ve, v0=v0, ngram_emb=ngram_emb)
             if v0 is None and raw_v is not None:
                 v0 = raw_v
             skips.append(x)
@@ -981,14 +976,11 @@ class GPT(nn.Module):
             bi = self.num_encoder_layers + i
             if skips:
                 x = x + self.skip_weights[i].to(dtype=x.dtype)[None, None, :] * skips.pop()
-            engram_out = self._get_engram(bi, x, ngram_emb)
-            if engram_out is not None:
-                x = x + engram_out
             ve = self._get_ve(bi, input_ids, ve_cache)
             x, _ = self.blocks[bi](x, x0,
                 self.qo_bank[bi], self.kv_bank[bi], self.kv_bank[n + bi],
                 self.qo_bank[n + bi], self.mlp_up_bank[bi], self.mlp_down_bank[bi],
-                v_embed=ve, v0=v0)
+                v_embed=ve, v0=v0, ngram_emb=ngram_emb)
         x = self.final_norm(x)
         x_flat = x.reshape(-1, x.size(-1))
         targets = target_ids.reshape(-1)
@@ -1025,7 +1017,7 @@ class GPT(nn.Module):
         if self.bigram is not None:
             ngram_emb = self.bigram(input_ids)
             x = x + ngram_emb
-        if not self.engram_layer_indices:
+        if not self._engram_layer_set:
             ngram_emb = None
         x = F.rms_norm(x, (x.size(-1),))
         x = self.smear(x)
@@ -1034,14 +1026,11 @@ class GPT(nn.Module):
         skips: list[Tensor] = []
         ve_cache: dict = {}
         for i in range(self.num_encoder_layers):
-            engram_out = self._get_engram(i, x, ngram_emb)
-            if engram_out is not None:
-                x = x + engram_out
             ve = self._get_ve(i, input_ids, ve_cache)
             x, raw_v = self.blocks[i](x, x0,
                 self.qo_bank[i], self.kv_bank[i], self.kv_bank[n + i],
                 self.qo_bank[n + i], self.mlp_up_bank[i], self.mlp_down_bank[i],
-                v_embed=ve, v0=v0)
+                v_embed=ve, v0=v0, ngram_emb=ngram_emb)
             if v0 is None and raw_v is not None:
                 v0 = raw_v
             skips.append(x)
@@ -1049,14 +1038,11 @@ class GPT(nn.Module):
             bi = self.num_encoder_layers + i
             if skips:
                 x = x + self.skip_weights[i].to(dtype=x.dtype)[None, None, :] * skips.pop()
-            engram_out = self._get_engram(bi, x, ngram_emb)
-            if engram_out is not None:
-                x = x + engram_out
             ve = self._get_ve(bi, input_ids, ve_cache)
             x, _ = self.blocks[bi](x, x0,
                 self.qo_bank[bi], self.kv_bank[bi], self.kv_bank[n + bi],
                 self.qo_bank[n + bi], self.mlp_up_bank[bi], self.mlp_down_bank[bi],
-                v_embed=ve, v0=v0)
+                v_embed=ve, v0=v0, ngram_emb=ngram_emb)
         x = self.final_norm(x)
         if self.tie_embeddings:
             logits_proj = F.linear(x, self.tok_emb.weight)
@@ -1423,7 +1409,7 @@ class _HessianMLP(nn.Module):
         return self.proj(F.leaky_relu(self.fc(x), negative_slope=0.5).square())
 
 class _HessianBlock(nn.Module):
-    def __init__(self, dim, num_heads, num_kv_heads, mlp_mult, rope_base, qk_gain_init, layer_idx=0, ln_scale=False):
+    def __init__(self, dim, num_heads, num_kv_heads, mlp_mult, rope_base, qk_gain_init, layer_idx=0, ln_scale=False, engram=False):
         super().__init__()
         self.attn_norm = RMSNorm()
         self.mlp_norm = RMSNorm()
@@ -1433,7 +1419,10 @@ class _HessianBlock(nn.Module):
         self.mlp_scale = nn.Parameter(torch.ones(dim, dtype=torch.float32))
         self.resid_mix = nn.Parameter(torch.stack((torch.ones(dim), torch.zeros(dim))).float())
         self.ln_scale_factor = 1.0 / math.sqrt(layer_idx + 1) if ln_scale else 1.0
-    def forward(self, x, x0, v_embed=None):
+        self.engram_gate = EngramGate(dim) if engram else None
+    def forward(self, x, x0, v_embed=None, ngram_emb=None):
+        if self.engram_gate is not None and ngram_emb is not None:
+            x = x + self.engram_gate(x, ngram_emb)
         mix = self.resid_mix.to(dtype=x.dtype)
         x_in = mix[0][None, None, :] * x + mix[1][None, None, :] * x0
         attn_out = self.attn(self.attn_norm(x_in) * self.ln_scale_factor, v_embed=v_embed)
@@ -1455,10 +1444,7 @@ class _HessianGPT(nn.Module):
         self.num_layers = num_layers
         self.tok_emb = nn.Embedding(vocab_size, model_dim)
         self.bigram = BigramHashEmbedding(bigram_vocab_size, bigram_dim, model_dim, trigram=bool(int(os.environ.get("TRIGRAM", "0"))), num_heads=bigram_heads) if bigram_vocab_size > 0 else None
-        self.engram_layer_indices = [int(x) for x in engram_layers.split(",") if x.strip()] if engram_layers else []
-        self.engram_gates = nn.ModuleList(
-            [EngramGate(model_dim) for _ in self.engram_layer_indices]
-        ) if self.engram_layer_indices else nn.ModuleList()
+        self._engram_layer_set = set(int(x) for x in engram_layers.split(",") if x.strip()) if engram_layers else set()
         self.smear = SmearGate(model_dim)
         self.num_encoder_layers = num_layers // 2
         self.num_decoder_layers = num_layers - self.num_encoder_layers
@@ -1466,7 +1452,7 @@ class _HessianGPT(nn.Module):
         self.skip_weights = nn.Parameter(torch.ones(self.num_skip_weights, model_dim, dtype=torch.float32))
         self.blocks = nn.ModuleList([
             _HessianBlock(model_dim, num_heads, num_kv_heads, mlp_mult, rope_base, qk_gain_init,
-                          layer_idx=i, ln_scale=ln_scale)
+                          layer_idx=i, ln_scale=ln_scale, engram=(i in self._engram_layer_set))
             for i in range(num_layers)
         ])
         if rope_dims > 0:
@@ -1494,18 +1480,13 @@ class _HessianGPT(nn.Module):
             ve_cache['ve'] = self.ve_shared(input_ids)
         ve_idx = self.ve_layer_indices.index(layer_idx)
         return ve_cache['ve'] * self.ve_layer_scales[ve_idx].to(dtype=ve_cache['ve'].dtype)
-    def _get_engram(self, layer_idx, hidden, ngram_emb):
-        if ngram_emb is None or layer_idx not in self.engram_layer_indices:
-            return None
-        gate_idx = self.engram_layer_indices.index(layer_idx)
-        return self.engram_gates[gate_idx](hidden, ngram_emb)
     def forward(self, input_ids, target_ids):
         x = self.tok_emb(input_ids)
         ngram_emb = None
         if self.bigram is not None:
             ngram_emb = self.bigram(input_ids)
             x = x + ngram_emb
-        if not self.engram_layer_indices:
+        if not self._engram_layer_set:
             ngram_emb = None
         x = F.rms_norm(x, (x.size(-1),))
         x = self.smear(x)
@@ -1513,21 +1494,15 @@ class _HessianGPT(nn.Module):
         skips = []
         ve_cache = {}
         for i in range(self.num_encoder_layers):
-            engram_out = self._get_engram(i, x, ngram_emb)
-            if engram_out is not None:
-                x = x + engram_out
             ve = self._get_ve(i, input_ids, ve_cache)
-            x = self.blocks[i](x, x0, v_embed=ve)
+            x = self.blocks[i](x, x0, v_embed=ve, ngram_emb=ngram_emb)
             skips.append(x)
         for i in range(self.num_decoder_layers):
             bi = self.num_encoder_layers + i
             if skips:
                 x = x + self.skip_weights[i].to(dtype=x.dtype)[None, None, :] * skips.pop()
-            engram_out = self._get_engram(bi, x, ngram_emb)
-            if engram_out is not None:
-                x = x + engram_out
             ve = self._get_ve(bi, input_ids, ve_cache)
-            x = self.blocks[bi](x, x0, v_embed=ve)
+            x = self.blocks[bi](x, x0, v_embed=ve, ngram_emb=ngram_emb)
         x = self.final_norm(x)
         x_flat = x.reshape(-1, x.size(-1))
         targets = target_ids.reshape(-1)
@@ -1763,10 +1738,7 @@ def main() -> None:
     scalar_params.append(base_model.smear.gate)
     if base_model.bigram is not None:
         scalar_params.append(base_model.bigram.scale)
-    # Engram gates are tiny (512→1 linear), add all params to scalar_params
-    for engram_gate in base_model.engram_gates:
-        for p in engram_gate.parameters():
-            scalar_params.append(p)
+    # Engram gates (inside blocks) are picked up by block_named_params above
     token_lr = args.tied_embed_lr if args.tie_embeddings else args.embed_lr
     tok_params = [{"params": [base_model.tok_emb.weight], "lr": token_lr, "base_lr": token_lr}]
     if base_model.bigram is not None:
