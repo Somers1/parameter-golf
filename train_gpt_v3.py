@@ -82,6 +82,8 @@ class Hyperparameters:
     bigram_dim = int(os.environ.get("BIGRAM_DIM", 128))
     trigram_enabled = bool(int(os.environ.get("TRIGRAM", "0")))  # TrigramHash (off by default, risky)
     engram_layers = os.environ.get("ENGRAM_LAYERS", "")  # e.g. "1,6" — inject gated bigram at these layers (empty = input-only, original behaviour)
+    engram_mode = os.environ.get("ENGRAM_MODE", "lite")  # "lite" = scalar gate, "full" = DeepSeek-style key/value projections
+    bigram_at_input = bool(int(os.environ.get("BIGRAM_AT_INPUT", "1")))  # 0 = disable input bigram (DeepSeek-style, engram-only)
     bigram_heads = int(os.environ.get("BIGRAM_HEADS", 1))  # 1 = single hash head (original), 2 = dual heads for fewer collisions
     xsa_last_n = int(os.environ.get("XSA_LAST_N", 11))  # XSA on ALL layers (our novel contribution)
     rope_dims = int(os.environ.get("ROPE_DIMS", 16))
@@ -723,18 +725,41 @@ class BigramHashEmbedding(nn.Module):
         if self.proj is not None:
             h = self.proj(h)
         return h * self.scale.to(dtype=h.dtype)
-class EngramGate(nn.Module):
-    """Lightweight scalar gate for n-gram injection at a specific layer.
-    Hidden state produces a scalar gate via a small linear; n-gram embedding
-    is injected directly (no value_proj) scaled by the gate."""
+class EngramGateLite(nn.Module):
+    """Lightweight scalar gate: hidden → scalar → scale ngram_emb."""
     def __init__(self, model_dim: int):
         super().__init__()
         self.gate_proj = nn.Linear(model_dim, 1, bias=True)
         nn.init.zeros_(self.gate_proj.weight)
         nn.init.constant_(self.gate_proj.bias, -2.0)  # sigmoid(-2) ≈ 0.12, starts mostly closed
     def forward(self, hidden: Tensor, ngram_emb: Tensor) -> Tensor:
-        gate = torch.sigmoid(self.gate_proj(hidden))  # (bsz, seq, 1)
+        gate = torch.sigmoid(self.gate_proj(hidden))
         return gate * ngram_emb
+
+
+class EngramGateFull(nn.Module):
+    """DeepSeek-style context-aware gate with key/value projections.
+    Dot-product gate between hidden state and n-gram embedding,
+    with sign-preserving sqrt normalization."""
+    def __init__(self, model_dim: int):
+        super().__init__()
+        self.key_proj = CastedLinear(model_dim, model_dim, bias=False)
+        self.value_proj = CastedLinear(model_dim, model_dim, bias=False)
+        nn.init.zeros_(self.value_proj.weight)
+        self._dim = model_dim
+    def forward(self, hidden: Tensor, ngram_emb: Tensor) -> Tensor:
+        key = F.rms_norm(self.key_proj(ngram_emb), (self._dim,))
+        query = F.rms_norm(hidden, (self._dim,))
+        gate = (key * query).sum(dim=-1, keepdim=True) / math.sqrt(self._dim)
+        gate = gate.abs().clamp_min(1e-6).sqrt() * gate.sign()
+        gate = gate.sigmoid()
+        return gate * self.value_proj(ngram_emb)
+
+
+def make_engram_gate(model_dim: int, mode: str = "lite") -> nn.Module:
+    if mode == "full":
+        return EngramGateFull(model_dim)
+    return EngramGateLite(model_dim)
 
 class ValueEmbedding(nn.Module):
     """Reinject token identity into attention values at specific layers.
@@ -775,7 +800,7 @@ class Block(nn.Module):
         dtg: bool = False,
         gated_attention: bool = False,
         value_residual: bool = False,
-        engram: bool = False,
+        engram: str = "",
     ):
         super().__init__()
         self.attn_norm = RMSNorm()
@@ -794,7 +819,7 @@ class Block(nn.Module):
         else:
             self.dtg_gate = None
         if engram:
-            self.engram_gate = EngramGate(dim)
+            self.engram_gate = make_engram_gate(dim, mode=engram)
         else:
             self.engram_gate = None
     def forward(self, x: Tensor, x0: Tensor, q_w: Tensor, k_w: Tensor, v_w: Tensor, out_w: Tensor, up_w: Tensor, down_w: Tensor, v_embed: Tensor | None = None, v0: Tensor | None = None, ngram_emb: Tensor | None = None) -> tuple[Tensor, Tensor | None]:
@@ -839,6 +864,8 @@ class GPT(nn.Module):
         gated_attention: bool = False,
         value_residual: bool = False,
         engram_layers: str = "",
+        engram_mode: str = "lite",
+        bigram_at_input: bool = True,
     ):
         super().__init__()
         self._ve_target_dim = num_kv_heads * (model_dim // num_heads)  # kv_dim for value projection
@@ -853,6 +880,8 @@ class GPT(nn.Module):
         self.tok_emb = nn.Embedding(vocab_size, model_dim)
         self.bigram = BigramHashEmbedding(bigram_vocab_size, bigram_dim, model_dim, trigram=bool(int(os.environ.get("TRIGRAM", "0"))), num_heads=bigram_heads) if bigram_vocab_size > 0 else None
         self._engram_layer_set = set(int(x) for x in engram_layers.split(",") if x.strip()) if engram_layers else set()
+        self._engram_mode = engram_mode
+        self._bigram_at_input = bigram_at_input
         self.smear = SmearGate(model_dim)
         self.num_encoder_layers = num_layers // 2
         self.num_decoder_layers = num_layers - self.num_encoder_layers
@@ -881,7 +910,7 @@ class GPT(nn.Module):
                     dtg=dtg,
                     gated_attention=gated_attention,
                     value_residual=value_residual,
-                    engram=(i in self._engram_layer_set),
+                    engram=(self._engram_mode if i in self._engram_layer_set else ""),
                 )
                 for i in range(num_layers)
             ]
@@ -954,7 +983,8 @@ class GPT(nn.Module):
         ngram_emb = None
         if self.bigram is not None:
             ngram_emb = self.bigram(input_ids)
-            x = x + ngram_emb
+            if self._bigram_at_input:
+                x = x + ngram_emb
         if not self._engram_layer_set:
             ngram_emb = None
         x = F.rms_norm(x, (x.size(-1),))
@@ -1016,7 +1046,8 @@ class GPT(nn.Module):
         ngram_emb = None
         if self.bigram is not None:
             ngram_emb = self.bigram(input_ids)
-            x = x + ngram_emb
+            if self._bigram_at_input:
+                x = x + ngram_emb
         if not self._engram_layer_set:
             ngram_emb = None
         x = F.rms_norm(x, (x.size(-1),))
@@ -1409,7 +1440,7 @@ class _HessianMLP(nn.Module):
         return self.proj(F.leaky_relu(self.fc(x), negative_slope=0.5).square())
 
 class _HessianBlock(nn.Module):
-    def __init__(self, dim, num_heads, num_kv_heads, mlp_mult, rope_base, qk_gain_init, layer_idx=0, ln_scale=False, engram=False):
+    def __init__(self, dim, num_heads, num_kv_heads, mlp_mult, rope_base, qk_gain_init, layer_idx=0, ln_scale=False, engram=""):
         super().__init__()
         self.attn_norm = RMSNorm()
         self.mlp_norm = RMSNorm()
@@ -1419,7 +1450,7 @@ class _HessianBlock(nn.Module):
         self.mlp_scale = nn.Parameter(torch.ones(dim, dtype=torch.float32))
         self.resid_mix = nn.Parameter(torch.stack((torch.ones(dim), torch.zeros(dim))).float())
         self.ln_scale_factor = 1.0 / math.sqrt(layer_idx + 1) if ln_scale else 1.0
-        self.engram_gate = EngramGate(dim) if engram else None
+        self.engram_gate = make_engram_gate(dim, mode=engram) if engram else None
     def forward(self, x, x0, v_embed=None, ngram_emb=None):
         if self.engram_gate is not None and ngram_emb is not None:
             x = x + self.engram_gate(x, ngram_emb)
@@ -1437,7 +1468,7 @@ class _HessianGPT(nn.Module):
                  bigram_vocab_size=0, bigram_dim=128, bigram_heads=1, xsa_last_n=0,
                  rope_dims=0, ln_scale=False,
                  ve_enabled=False, ve_dim=128, ve_layers="9,10",
-                 engram_layers=""):
+                 engram_layers="", engram_mode="lite", bigram_at_input=True):
         super().__init__()
         self.tie_embeddings = tie_embeddings
         self.logit_softcap = logit_softcap
@@ -1445,6 +1476,8 @@ class _HessianGPT(nn.Module):
         self.tok_emb = nn.Embedding(vocab_size, model_dim)
         self.bigram = BigramHashEmbedding(bigram_vocab_size, bigram_dim, model_dim, trigram=bool(int(os.environ.get("TRIGRAM", "0"))), num_heads=bigram_heads) if bigram_vocab_size > 0 else None
         self._engram_layer_set = set(int(x) for x in engram_layers.split(",") if x.strip()) if engram_layers else set()
+        self._engram_mode = engram_mode
+        self._bigram_at_input = bigram_at_input
         self.smear = SmearGate(model_dim)
         self.num_encoder_layers = num_layers // 2
         self.num_decoder_layers = num_layers - self.num_encoder_layers
@@ -1452,7 +1485,7 @@ class _HessianGPT(nn.Module):
         self.skip_weights = nn.Parameter(torch.ones(self.num_skip_weights, model_dim, dtype=torch.float32))
         self.blocks = nn.ModuleList([
             _HessianBlock(model_dim, num_heads, num_kv_heads, mlp_mult, rope_base, qk_gain_init,
-                          layer_idx=i, ln_scale=ln_scale, engram=(i in self._engram_layer_set))
+                          layer_idx=i, ln_scale=ln_scale, engram=(self._engram_mode if i in self._engram_layer_set else ""))
             for i in range(num_layers)
         ])
         if rope_dims > 0:
@@ -1485,7 +1518,8 @@ class _HessianGPT(nn.Module):
         ngram_emb = None
         if self.bigram is not None:
             ngram_emb = self.bigram(input_ids)
-            x = x + ngram_emb
+            if self._bigram_at_input:
+                x = x + ngram_emb
         if not self._engram_layer_set:
             ngram_emb = None
         x = F.rms_norm(x, (x.size(-1),))
@@ -1703,6 +1737,8 @@ def main() -> None:
         gated_attention=args.gated_attention,
         value_residual=args.value_residual,
         engram_layers=args.engram_layers,
+        engram_mode=args.engram_mode,
+        bigram_at_input=args.bigram_at_input,
     ).to(device).bfloat16()
     # Banks stay FP32 (like CastedLinear weights), cast to BF16 in forward
     base_model.qo_bank.data = base_model.qo_bank.data.float()
@@ -2024,6 +2060,8 @@ def main() -> None:
         xsa_last_n=args.xsa_last_n, rope_dims=args.rope_dims, ln_scale=args.ln_scale,
         ve_enabled=args.ve_enabled, ve_dim=args.ve_dim, ve_layers=args.ve_layers,
         engram_layers=args.engram_layers,
+        engram_mode=args.engram_mode,
+        bigram_at_input=args.bigram_at_input,
     ).to(device).bfloat16()
     for m in hessian_model.modules():
         if isinstance(m, CastedLinear):
@@ -2131,6 +2169,8 @@ def main() -> None:
         ve_enabled=args.ve_enabled, ve_dim=args.ve_dim, ve_layers=args.ve_layers,
         gated_attention=args.gated_attention, value_residual=args.value_residual,
         engram_layers=args.engram_layers,
+        engram_mode=args.engram_mode,
+        bigram_at_input=args.bigram_at_input,
     ).to(device).bfloat16()
     eval_model.qo_bank.data = eval_model.qo_bank.data.float()
     eval_model.kv_bank.data = eval_model.kv_bank.data.float()
