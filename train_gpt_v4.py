@@ -807,7 +807,8 @@ class PerLayerEmbedding(nn.Module):
         nn.init.normal_(self.embed.weight, std=0.02)
         self.proj = CastedLinear(ple_dim, model_dim, bias=False)
         nn.init.zeros_(self.proj.weight)
-        self.scales = nn.Parameter(torch.full((num_layers,), 0.1, dtype=torch.float32))
+        ple_scale_init = float(os.environ.get("PLE_SCALE_INIT", "0.0"))
+        self.scales = nn.Parameter(torch.full((num_layers,), ple_scale_init, dtype=torch.float32))
 
     @property
     def _vocab_size(self) -> int:
